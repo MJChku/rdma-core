@@ -118,24 +118,29 @@ static void read_config(void)
 	DIR *conf_dir;
 	struct dirent *dent;
 	char *path;
+	const char *conf_dir_path;
 
-	conf_dir = opendir(IBV_CONFIG_DIR);
+	conf_dir_path = getenv("IBV_CONFIG_DIR");
+	if (!conf_dir_path || !conf_dir_path[0])
+		conf_dir_path = IBV_CONFIG_DIR;
+
+	conf_dir = opendir(conf_dir_path);
 	if (!conf_dir) {
 		fprintf(stderr,
 			PFX "Warning: couldn't open config directory '%s'.\n",
-			IBV_CONFIG_DIR);
+			conf_dir_path);
 		return;
 	}
 
 	while ((dent = readdir(conf_dir))) {
 		struct stat buf;
 
-		if (asprintf(&path, "%s/%s", IBV_CONFIG_DIR, dent->d_name) <
+		if (asprintf(&path, "%s/%s", conf_dir_path, dent->d_name) <
 		    0) {
 			fprintf(stderr,
 				PFX
 				"Warning: couldn't read config file %s/%s.\n",
-				IBV_CONFIG_DIR, dent->d_name);
+				conf_dir_path, dent->d_name);
 			goto out;
 		}
 
@@ -163,6 +168,7 @@ static void load_driver(const char *name)
 {
 	char *so_name;
 	void *dlhandle;
+	const char *env_driver_dir;
 
 	/* If the name is an absolute path then open that path after appending
 	 * the trailer suffix
@@ -178,6 +184,19 @@ static void load_driver(const char *name)
 	}
 
 	/* If configured with a provider plugin path then try that next */
+	env_driver_dir = getenv("IBV_DRIVER_DIR");
+	if (!env_driver_dir || !env_driver_dir[0])
+		env_driver_dir = getenv("IBV_DRIVERS_DIR");
+	if (env_driver_dir && env_driver_dir[0]) {
+		if (asprintf(&so_name, "%s/lib%s" VERBS_PROVIDER_SUFFIX,
+			     env_driver_dir, name) < 0)
+			goto out_asprintf;
+		dlhandle = dlopen(so_name, RTLD_NOW);
+		free(so_name);
+		if (dlhandle)
+			return;
+	}
+
 	if (sizeof(VERBS_PROVIDER_DIR) > 1) {
 		if (asprintf(&so_name,
 			     VERBS_PROVIDER_DIR "/lib%s" VERBS_PROVIDER_SUFFIX,

@@ -35,6 +35,9 @@
 #include <infiniband/driver.h>
 #include <infiniband/all_providers.h>
 
+/* Declare external provider symbols for static linking */
+extern const struct verbs_device_ops verbs_provider_nex;
+
 /* When static linking this object will be included in the final link only if
  * something refers to the 'verbs_provider_all' symbol. It in turn brings all
  * the providers into the link as well. Otherwise the static linker will not

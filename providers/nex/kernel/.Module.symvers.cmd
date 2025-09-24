@@ -1,0 +1,1 @@
+savedcmd_/home/jma/NEX/src/sims/ib/rdma-core/providers/nex/kernel/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/jma/NEX/src/sims/ib/rdma-core/providers/nex/kernel/Module.symvers -T /home/jma/NEX/src/sims/ib/rdma-core/providers/nex/kernel/modules.order -i Module.symvers -e 

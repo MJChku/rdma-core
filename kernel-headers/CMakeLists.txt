@@ -75,6 +75,7 @@ rdma_kernel_provider_abi(
   rdma/mlx4-abi.h
   rdma/mlx5-abi.h
   rdma/mthca-abi.h
+  rdma/nex-abi.h
   rdma/ocrdma-abi.h
   rdma/qedr-abi.h
   rdma/rdma_user_rxe.h
