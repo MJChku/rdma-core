@@ -23,7 +23,10 @@
 #include <infiniband/verbs.h>
 
 #include "nex.h"
+#include "nex_shm.h"
 #include "cm/nex_cm.h"
+
+// #define USE_TCP
 
 static int get_nex_id(void);
 
@@ -110,6 +113,7 @@ static inline uint32_t nex_next_key(struct nex_context *ctx)
 
 static int nex_write_full(int fd, const void *buf, size_t len)
 {
+#ifdef USE_TCP
 	const uint8_t *p = buf;
 	while (len > 0) {
 		ssize_t n = write(fd, p, len);
@@ -123,11 +127,20 @@ static int nex_write_full(int fd, const void *buf, size_t len)
 		p += n;
 		len -= (size_t)n;
 	}
+#else
+	ssize_t n = nex_shm_write(fd, buf, len);
+	if (n != len) {
+		NEX_TRACE("nex_shm_write failed n=%zd len=%zu errno=%d", n, len, errno);
+		return -1;
+	}
+#endif
+
 	return 0;
 }
 
 static int nex_read_full(int fd, void *buf, size_t len)
 {
+#ifdef USE_TCP
 	uint8_t *p = buf;
 	while (len > 0) {
 		ssize_t n = read(fd, p, len);
@@ -141,6 +154,10 @@ static int nex_read_full(int fd, void *buf, size_t len)
 		p += n;
 		len -= (size_t)n;
 	}
+#else 
+	ssize_t n = nex_shm_read(fd, buf, len);
+	if (n != len) return -1;
+#endif
 	return 0;
 }
 
@@ -434,8 +451,7 @@ static int nex_dealloc_pd(struct ibv_pd *pd)
 static struct ibv_mr *nex_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 				 uint64_t hca_va, int access)
 {
-	printf("nex: reg_mr addr=%p len=%zu access=0x%x\n", addr, length, access);
-	fflush(stdout);
+	NEX_TRACE("reg_mr addr=%p len=%zu access=0x%x\n", addr, length, access);
 	struct nex_context *ctx = to_nctx(pd->context);
 	struct nex_mr *mr = calloc(1, sizeof(*mr));
 	if (!mr) {
@@ -641,9 +657,18 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 		pthread_cond_broadcast(&qp->recv_cond);
 		pthread_mutex_unlock(&qp->lock);
 		if (qp->rx_fd >= 0)
+			#ifdef USE_TCP
 			shutdown(qp->rx_fd, SHUT_RDWR);
+			#else
+			nex_shm_shutdown(qp->rx_fd);
+			#endif
 		if (qp->tx_fd >= 0)
+			#ifdef USE_TCP
 			shutdown(qp->tx_fd, SHUT_RDWR);
+			#else
+			nex_shm_shutdown(qp->tx_fd);
+			#endif
+
 		pthread_join(qp->rx_thread, NULL);
 	}
 	if (qp->tx_fd >= 0)
@@ -833,7 +858,8 @@ static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 			errno = ENOTSUP;
 			return ENOTSUP;
 		}
-	       NEX_TRACE("post_recv wr_id=%" PRIu64 " num_sge=%d len=%u qp=%u",
+	    
+		NEX_TRACE("post_recv wr_id=%" PRIu64 " num_sge=%d len=%u qp=%u",
 		       (uint64_t)wr->wr_id, wr->num_sge,
 		       wr->num_sge ? wr->sg_list[0].length : 0U,
 		       qp->vqp.qp.qp_num);
@@ -922,7 +948,6 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		uint8_t *tmp = NULL;
 		size_t payload_len = total_len;
 
-		NEX_TRACE("post_send opcode=%d", wr->opcode);
 		switch (wr->opcode) {
 		case IBV_WR_SEND:
 			hdr.opcode = NEX_MSG_SEND;
@@ -1048,7 +1073,6 @@ static void *nex_rx_worker(void *arg)
 				break;
 			if (nex_read_full(qp->rx_fd, &hdr, sizeof(hdr)))
 				break;
-			
 
 			bool expect_payload = (hdr.opcode == NEX_MSG_SEND ||
 				        hdr.opcode == NEX_MSG_RDMA_WRITE ||
@@ -1082,8 +1106,10 @@ static void *nex_rx_worker(void *arg)
 
 			if (!nex_try_take_recv(qp, &entry_copy)) {
 				/* No RECV posted yet: queue for later and continue */
-				NEX_TRACE("send without posted recv, wr_id=%" PRIu64 " qp_pair=%u:%u", hdr.wr_id,
+				NEX_TRACE("ERROR: send without posted recv, wr_id=%" PRIu64 " qp_pair=%u:%u", hdr.wr_id,
 					   qp->vqp.qp.qp_num, qp->remote_qp_num);
+				fflush(stderr);
+				exit(1);
 				// nex_push_pending_msg(qp, &hdr, payload, payload_len);
 				payload = NULL; 
 				break;
@@ -1135,8 +1161,8 @@ static void *nex_rx_worker(void *arg)
 						uintptr_t dest = hdr.remote_addr;
 
 						NEX_TRACE("rdma_write to rkey=0x%x hdr.opcode=%d hdr.remote_addr=0x%" PRIxPTR
-									" addr=0x%" PRIxPTR " len=%u qp_pair=%u:%u",
-									hdr.rkey, hdr.opcode, dest, mr->vmr.ibv_mr.addr, mr->vmr.ibv_mr.length,
+									" addr=0x%" PRIxPTR " mr_len=%u header_len=%u qp_pair=%u:%u",
+									hdr.rkey, hdr.opcode, dest, mr->vmr.ibv_mr.addr, mr->vmr.ibv_mr.length, hdr.length,
 									qp->vqp.qp.qp_num, qp->remote_qp_num);
 
 						if (dest < base || dest + hdr.length > end) {
@@ -1162,8 +1188,10 @@ static void *nex_rx_worker(void *arg)
 				if (!nex_try_take_recv(qp, &entry_copy)) {
 					// If no posted RECV
 					payload = NULL;
-					NEX_TRACE("rdma_write_imm without posted recv, wr_id=%" PRIu64 " qp_pair=%u:%u",
+					NEX_TRACE("ERROR: rdma_write_imm without posted recv, wr_id=%" PRIu64 " qp_pair=%u:%u",
 								hdr.wr_id, qp->vqp.qp.qp_num, qp->remote_qp_num);
+					fflush(stderr);
+					exit(1);
 					break;
 				}
 
@@ -1301,7 +1329,7 @@ static void *nex_rx_worker(void *arg)
 }
 
 // should replace this with real test; don't know how to handle yet
-static const char *nex_get_service_id(struct nex_qp* qp)
+static char *nex_get_service_id(struct nex_qp* qp)
 {
 	struct nex_context* ctx = qp->ctx;
 	int lid = ctx->lid;
@@ -1373,6 +1401,9 @@ fail:
 // central server assigns role (listen/connect) to each side, and match the pairs
 static int nex_qp_establish_sync(struct nex_qp *qp)
 {
+
+
+#ifdef USE_TCP
 	int listen_fd = -1;
 	uint16_t listen_port = 0;
 	struct sockaddr_in addr;
@@ -1417,13 +1448,14 @@ static int nex_qp_establish_sync(struct nex_qp *qp)
 		   service_id, peer.qp_num, my_host, peer.host, peer.port, role, qp->vqp.qp.qp_num, peer.qp_num);
 
 	int data_fd = -1;
+
 	if (role == NEX_CM_ROLE_LISTEN) {
 		data_fd = accept(listen_fd, NULL, NULL);
 		if (data_fd < 0)
 			goto close_listen;
 		close(listen_fd);
 		listen_fd = -1;
-			NEX_TRACE("accepted connection qp_pair=%u:%u", qp->vqp.qp.qp_num, qp->remote_qp_num);
+		NEX_TRACE("accepted connection qp_pair=%u:%u", qp->vqp.qp.qp_num, qp->remote_qp_num);
 	} else {
 		char portbuf[16];
 		struct addrinfo hints = {
@@ -1457,6 +1489,7 @@ static int nex_qp_establish_sync(struct nex_qp *qp)
 		NEX_TRACE("connected to %s:%u qp_pair=%u:%u", peer.host, peer.port, qp->vqp.qp.qp_num, peer.qp_num);
 	}
 
+
 	qp->remote_qp_num = peer.qp_num;
 	qp->tx_fd = data_fd;
 	qp->rx_fd = data_fd;
@@ -1475,6 +1508,42 @@ close_listen:
 	if (listen_fd >= 0)
 		close(listen_fd);
 	return errno ? errno : EIO;
+#else
+
+	/* after role is determined */
+	struct nex_context* ctx = qp->ctx;
+	int lid = ctx->lid;
+	int remote_lid = qp->remote_lid;
+	int qp_num = qp->vqp.qp.qp_num;
+	int remote_qp_num = qp->remote_qp_num;
+
+	char* service_id = nex_get_service_id(qp);
+
+	int unified_fd = -1;
+
+	int rc = nex_shm_dial(service_id, &unified_fd);
+	if (rc != 0) {
+		NEX_TRACE("SHM dial failed service_id=%s error=%d",
+			   service_id, rc);
+		return rc;
+	}	
+
+	NEX_TRACE("SHM ready service_id=%s unified_fd=%d qp_pair=%u:%u",
+			service_id, unified_fd, qp->vqp.qp.qp_num, qp->remote_qp_num);
+
+	qp->tx_fd = unified_fd;
+	qp->rx_fd = unified_fd;
+	qp->rx_running = true;
+	if (pthread_create(&qp->rx_thread, NULL, nex_rx_worker, qp)) {
+		int err = errno ? errno : EIO;
+		qp->rx_running = false;
+		nex_shm_close(unified_fd);
+		qp->tx_fd = qp->rx_fd = -1;
+		return err;
+	}
+	return 0;
+
+#endif
 }
 
 /* Global QP reservation (per device; cross processes) -------------------------------- */

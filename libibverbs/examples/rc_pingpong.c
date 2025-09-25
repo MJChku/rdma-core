@@ -1192,6 +1192,8 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	printf("Exchange complete (RC mode)\n");
+
 	ibv_ack_cq_events(pp_cq(ctx), num_cq_events);
 
 	if (pp_close_ctx(ctx))

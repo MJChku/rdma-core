@@ -310,7 +310,7 @@ LATEST_SYMVER_FUNC(ibv_dealloc_pd, 1_1, "IBVERBS_1.1",
 struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
 				uint64_t iova, unsigned int access)
 {
-	printf("ibv_reg_mr_iova2 addr=%p len=%zu iova=0x%lx access=0x%x\n", addr, length, iova, access);
+	// printf("ibv_reg_mr_iova2 addr=%p len=%zu iova=0x%lx access=0x%x\n", addr, length, iova, access);
 	struct verbs_device *device = verbs_get_device(pd->context->device);
 	bool odp_mr = access & IBV_ACCESS_ON_DEMAND;
 	struct ibv_mr *mr;
@@ -325,7 +325,6 @@ struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
 		return NULL;
 	}
 
-	printf("Calling provider reg_mr_ex\n");
 	mr = get_ops(pd->context)->reg_mr(pd, addr, length, iova, access);
 	if (mr) {
 		mr->context = pd->context;
