@@ -24,25 +24,44 @@ static int get_nex_id(void);
 #define NEX_TRACE(fmt, ...) do { } while (0)
 #endif
 
+// extern void _nex_virtual_speedup_start(int percentage) __attribute__((weak));
+// extern void _nex_virtual_speedup_end() __attribute__((weak));
 
 void yield(){
-  nanosleep((const struct timespec[]){{0, 1000000}}, NULL);
+  sched_yield();
+  // nanosleep((const struct timespec[]){{0, 1000000}}, NULL);
+}
+
+void nex_fast_memcpy(void* dst, const void* src, size_t len) {
+  // 6byte per nano second
+  // 64byte 10 nano second
+  // 300 ns for 2KB
+  // 1 us for using virtual speedup
+  // 32KB 5 us
+  if(len >= 32768){
+    // _nex_virtual_speedup_start(4000);
+    memcpy(dst, src, len);
+    // _nex_virtual_speedup_end();
+  }else{
+    memcpy(dst, src, len);
+  }
 }
 
 static int get_nex_id(void){
 	static int initialized = 0;
 	static int nex_id = 0;
-	// if(initialized) return nex_id;
+	
+	if(__atomic_load_n(&initialized, __ATOMIC_ACQUIRE)) return nex_id;
 	//get env NEX_ID
 	const char* env_p = getenv("NEX_ID");
 	if(env_p == NULL){
 		return nex_id;
 	}
 	nex_id = atoi(env_p);
+	
+	__atomic_thread_fence(__ATOMIC_RELEASE);
 
-  __atomic_thread_fence(__ATOMIC_RELEASE);
-
-	initialized = 1;
+	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
 
 	return nex_id;
 }

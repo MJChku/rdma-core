@@ -7,3 +7,4 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len);
 ssize_t nex_shm_write(int fd, const void* buf, size_t len);
 int nex_shm_close(int fd);
 int nex_shm_shutdown(int fd);
+void nex_fast_memcpy(void* dst, const void* src, size_t len);

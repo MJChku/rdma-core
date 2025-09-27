@@ -89,14 +89,19 @@ struct nex_pending_msg {
 static int get_nex_id(void){
 	static int initialized = 0;
 	static int nex_id = 0;
-	if(initialized) return nex_id;
-	initialized = 1;
+	
+	if(__atomic_load_n(&initialized, __ATOMIC_ACQUIRE)) return nex_id;
 	//get env NEX_ID
 	const char* env_p = getenv("NEX_ID");
 	if(env_p == NULL){
 		return nex_id;
 	}
 	nex_id = atoi(env_p);
+	
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+
+	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+
 	return nex_id;
 }
 
@@ -451,7 +456,19 @@ static int nex_dealloc_pd(struct ibv_pd *pd)
 static struct ibv_mr *nex_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 				 uint64_t hca_va, int access)
 {
-	NEX_TRACE("reg_mr addr=%p len=%zu access=0x%x\n", addr, length, access);
+	NEX_TRACE("reg_mr addr=%p len=%zu access=0x%x", addr, length, access);
+
+	if (!length) {
+		errno = EINVAL;
+		NEX_TRACE("reg_mr rejecting zero-length registration");
+		return NULL;
+	}
+
+	if (!addr && !(access & IBV_ACCESS_ZERO_BASED)) {
+		errno = EINVAL;
+		NEX_TRACE("reg_mr requires valid addr unless zero-based flag set");
+		return NULL;
+	}
 	struct nex_context *ctx = to_nctx(pd->context);
 	struct nex_mr *mr = calloc(1, sizeof(*mr));
 	if (!mr) {
@@ -566,13 +583,16 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 {
     struct nex_context *ctx = to_nctx(pd->context);
     struct nex_qp *qp = calloc(1, sizeof(*qp));
-	if (!qp)
+	if (!qp){
+		NEX_TRACE("create_qp: calloc failed");
 		return NULL;
+	}
 
 	struct nex_cq *send_cq = to_ncq(attr->send_cq);
 	struct nex_cq *recv_cq = to_ncq(attr->recv_cq);
 	if (!send_cq || !recv_cq) {
 		free(qp);
+		NEX_TRACE("create_qp: invalid send/recv CQ");
 		errno = EINVAL;
 		return NULL;
 	}
@@ -589,6 +609,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 	qp->recv_queue = calloc(qp->recv_size, sizeof(*qp->recv_queue));
 	if (!qp->recv_queue) {
 		free(qp);
+		NEX_TRACE("create_qp: recv_queue calloc failed");
 		return NULL;
 	}
 	qp->recv_head = qp->recv_tail = 0;
@@ -641,6 +662,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
         pthread_cond_destroy(&qp->vqp.qp.cond);
         free(qp->recv_queue);
         free(qp);
+		NEX_TRACE("create_qp: nex_qp_reserve failed");
         return NULL;
     }
 
@@ -1000,7 +1022,7 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				}
 				size_t off = 0;
 				for (int i = 0; i < wr->num_sge; ++i) {
-					memcpy(tmp + off, (void *)(uintptr_t)wr->sg_list[i].addr,
+					nex_fast_memcpy(tmp + off, (void *)(uintptr_t)wr->sg_list[i].addr,
 					       wr->sg_list[i].length);
 					off += wr->sg_list[i].length;
 				}
@@ -1123,7 +1145,7 @@ static void *nex_rx_worker(void *arg)
 				copy_len = hdr.length;
 				if (copy_len > entry_copy.sge.length)
 					copy_len = entry_copy.sge.length;
-				memcpy((void *)(uintptr_t)entry_copy.sge.addr, payload, copy_len);
+				nex_fast_memcpy((void *)(uintptr_t)entry_copy.sge.addr, payload, copy_len);
 			}
 
 			struct ibv_wc recv_wc = {
@@ -1168,7 +1190,7 @@ static void *nex_rx_worker(void *arg)
 						if (dest < base || dest + hdr.length > end) {
 							status = -EINVAL;
 						} else if (payload && hdr.length) {
-							memcpy((void *)dest, payload, hdr.length);
+							nex_fast_memcpy((void *)dest, payload, hdr.length);
 							copy_len = hdr.length;
 						}
 					}
@@ -1204,7 +1226,7 @@ static void *nex_rx_worker(void *arg)
 						copy_len = hdr.length;
 						if (copy_len > entry_copy.sge.length)
 							copy_len = entry_copy.sge.length;
-						memcpy((void *)(uintptr_t)entry_copy.sge.addr, payload, copy_len);
+						nex_fast_memcpy((void *)(uintptr_t)entry_copy.sge.addr, payload, copy_len);
 					}
 				} else {
 					copy_len = 0;
@@ -1265,7 +1287,7 @@ static void *nex_rx_worker(void *arg)
 						resp.status = NEX_MSG_STATUS_REMOTE_ERROR;
 						resp.length = 0;
 					} else {
-						memcpy(resp_buf, (void *)src, hdr.length);
+						nex_fast_memcpy(resp_buf, (void *)src, hdr.length);
 					}
 				}
 			}
@@ -1297,7 +1319,7 @@ static void *nex_rx_worker(void *arg)
 					size_t chunk = entry->sge[i].length;
 					if (chunk > remaining)
 						chunk = remaining;
-					memcpy((void *)(uintptr_t)entry->sge[i].addr, src, chunk);
+					nex_fast_memcpy((void *)(uintptr_t)entry->sge[i].addr, src, chunk);
 					src += chunk;
 					remaining -= chunk;
 					read_wc.byte_len += (uint32_t)chunk;
@@ -1560,6 +1582,7 @@ static int nex_qp_reserve(struct nex_qp *qp)
     uint32_t new = __sync_add_and_fetch(ctx->qp_counter, 1);
     uint32_t limit = ctx->qp_limit ? ctx->qp_limit : NEX_DEFAULT_MAX_QP;
     if (new > limit) {
+		NEX_TRACE("ERROR: QP limit exceeded (%u) new=%u", limit, new);
         __sync_sub_and_fetch(ctx->qp_counter, 1);
         errno = ENOSPC;
         return -1;
