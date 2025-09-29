@@ -30,7 +30,7 @@
 
 static int get_nex_id(void);
 
-#define DEBUG
+// #define DEBUG
 #ifdef DEBUG
 #define NEX_TRACE(fmt, ...) fprintf(stderr, "nex (%d): " fmt "\n", get_nex_id(), ##__VA_ARGS__)
 #else

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <dlfcn.h>
 #include "nex_shm.h"
 
 static int get_nex_id(void);
@@ -24,8 +25,60 @@ static int get_nex_id(void);
 #define NEX_TRACE(fmt, ...) do { } while (0)
 #endif
 
-// extern void _nex_virtual_speedup_start(int percentage) __attribute__((weak));
-// extern void _nex_virtual_speedup_end() __attribute__((weak));
+// extern void nex_virtual_speedup_start(int percentage);
+// extern void nex_virtual_speedup_end();
+// extern int send_data(uint32_t src_addr, uint32_t dst_addr, size_t len);
+// extern int recv_data(uint32_t src_addr, uint32_t dst_addr, size_t len);
+
+typedef void (*nex_virtual_speedup_start_t)(int percentage);
+typedef void (*nex_virtual_speedup_end_t)(void);
+typedef int (*send_data_t)(uint32_t src_addr, uint32_t dst_addr, size_t len);
+typedef int (*recv_data_t)(uint32_t src_addr, uint32_t dst_addr, size_t len);
+
+struct accvm_symbols {
+    nex_virtual_speedup_start_t nex_virtual_speedup_start;
+    nex_virtual_speedup_end_t nex_virtual_speedup_end;
+    send_data_t send_data;
+    recv_data_t recv_data;
+};
+
+static struct accvm_symbols accvm_syms = {0};
+
+void* get_accvm_lib(){
+    void* handle = dlopen("accvm.so", RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) {
+        fprintf(stderr, "Error loading libaccvm.so: %s\n", dlerror());
+        return NULL;
+    }
+    return handle;
+}
+
+int get_accvm_symbols(struct accvm_symbols* syms) {
+    void* handle = get_accvm_lib();
+    if (!handle) return -1;
+
+    syms->nex_virtual_speedup_start = (nex_virtual_speedup_start_t)dlsym(handle, "nex_virtual_speedup_start");
+    if (!syms->nex_virtual_speedup_start) {
+        fprintf(stderr, "Error getting nex_virtual_speedup_start: %s\n", dlerror());
+    }
+
+    syms->nex_virtual_speedup_end = (nex_virtual_speedup_end_t)dlsym(handle, "nex_virtual_speedup_end");
+    if (!syms->nex_virtual_speedup_end) {
+        fprintf(stderr, "Error getting nex_virtual_speedup_end: %s\n", dlerror());
+    }
+
+    syms->send_data = (send_data_t)dlsym(handle, "send_data");
+    if (!syms->send_data) {
+        fprintf(stderr, "Error getting send_data: %s\n", dlerror());
+    }
+
+    syms->recv_data = (recv_data_t)dlsym(handle, "recv_data");
+    if (!syms->recv_data) {
+        fprintf(stderr, "Error getting recv_data: %s\n", dlerror());
+    }
+
+    return 0;
+}
 
 void yield(){
   sched_yield();
@@ -39,9 +92,9 @@ void nex_fast_memcpy(void* dst, const void* src, size_t len) {
   // 1 us for using virtual speedup
   // 32KB 5 us
   if(len >= 32768){
-    // _nex_virtual_speedup_start(4000);
+    // nex_virtual_speedup_start(4000);
     memcpy(dst, src, len);
-    // _nex_virtual_speedup_end();
+    // nex_virtual_speedup_end();
   }else{
     memcpy(dst, src, len);
   }
@@ -130,7 +183,6 @@ static size_t pow2_u64(size_t v) {
 }
 
 static int shm_path_from_tuple(const char* lid, const char* qp, char* out, size_t outsz) {
-  // you asked the name to be exactly "<lid>:<qp>"
   return snprintf(out, outsz, "%s:%s", lid, qp) >= (int)outsz ? -ENAMETOOLONG : 0;
 }
 
@@ -202,6 +254,8 @@ static int open_local_ring(const char* name, uint64_t bytes, struct shm_ring* ou
   out->buf = (uint8_t*)(h + 1);
   out->fd = fd;
   out->map_len = map_len;
+
+  get_accvm_symbols(&accvm_syms);
   return 0;
 }
 
@@ -332,6 +386,8 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len) {
   size_t done = 0;
   int iter = 0;
 
+   accvm_syms.recv_data(0, 0, len);
+
   while (done < len) {
 
     // pthread_mutex_lock(&h->lock);
@@ -383,6 +439,8 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len) {
 
   size_t done = 0;
   int iter = 0;
+
+  accvm_syms.send_data(0, 0, len);
 
   while (done < len) {
     // pthread_mutex_lock(&h->lock);
