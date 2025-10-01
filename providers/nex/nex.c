@@ -678,25 +678,35 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
         qp->rx_running = false;
 		pthread_cond_broadcast(&qp->recv_cond);
 		pthread_mutex_unlock(&qp->lock);
+		#ifdef USE_TCP
 		if (qp->rx_fd >= 0)
-			#ifdef USE_TCP
 			shutdown(qp->rx_fd, SHUT_RDWR);
-			#else
-			nex_shm_shutdown(qp->rx_fd);
-			#endif
 		if (qp->tx_fd >= 0)
-			#ifdef USE_TCP
 			shutdown(qp->tx_fd, SHUT_RDWR);
-			#else
-			nex_shm_shutdown(qp->tx_fd);
-			#endif
+		#else
+		int shm_fd = qp->tx_fd >= 0 ? qp->tx_fd : qp->rx_fd;
+		if (shm_fd >= 0)
+			nex_shm_shutdown(shm_fd);
+		#endif
 
 		pthread_join(qp->rx_thread, NULL);
 	}
+	#ifdef USE_TCP
 	if (qp->tx_fd >= 0)
 		close(qp->tx_fd);
 	if (qp->rx_fd >= 0)
 		close(qp->rx_fd);
+	#else
+	if (qp->tx_fd >= 0) {
+		nex_shm_close(qp->tx_fd);
+		qp->tx_fd = -1;
+		qp->rx_fd = -1;
+	} else if (qp->rx_fd >= 0) {
+		/* Safety: handle hypothetical cases where tx/rx differ. */
+		nex_shm_close(qp->rx_fd);
+		qp->rx_fd = -1;
+	}
+	#endif
 	pthread_mutex_destroy(&qp->lock);
 	pthread_cond_destroy(&qp->recv_cond);
 	pthread_mutex_destroy(&qp->send_lock);
