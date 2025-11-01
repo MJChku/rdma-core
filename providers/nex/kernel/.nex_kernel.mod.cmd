@@ -1,1 +1,1 @@
-savedcmd_/home/jma/NEX/src/sims/ib/rdma-core/providers/nex/kernel/nex_kernel.mod := printf '%s\n'   nex_kernel.o | awk '!x[$$0]++ { print("/home/jma/NEX/src/sims/ib/rdma-core/providers/nex/kernel/"$$0) }' > /home/jma/NEX/src/sims/ib/rdma-core/providers/nex/kernel/nex_kernel.mod
+savedcmd_/home/jiacma/nex-dist/src/sims/ib/rdma-core/providers/nex/kernel/nex_kernel.mod := printf '%s\n'   nex_kernel.o | awk '!x[$$0]++ { print("/home/jiacma/nex-dist/src/sims/ib/rdma-core/providers/nex/kernel/"$$0) }' > /home/jiacma/nex-dist/src/sims/ib/rdma-core/providers/nex/kernel/nex_kernel.mod

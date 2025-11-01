@@ -28,7 +28,7 @@ struct nex_context {
     int qp_counter_fd;
     uint32_t *qp_counter;
     uint32_t qp_limit;
-    pthread_mutex_t mr_lock;
+    pthread_spinlock_t mr_lock;
     struct nex_mr *mr_list;
 	int gid;
 	int lid;
@@ -44,7 +44,7 @@ struct nex_cq {
 	uint32_t capacity;
 	uint32_t head;
 	uint32_t tail;
-	pthread_mutex_t lock;
+	pthread_spinlock_t lock;
 	pthread_cond_t cond;
 };
 
@@ -68,7 +68,7 @@ struct nex_qp {
 	struct nex_context *ctx;
 	struct nex_cq *send_cq;
 	struct nex_cq *recv_cq;
-	pthread_mutex_t lock;
+	pthread_spinlock_t lock;
 	pthread_cond_t recv_cond;
 	struct nex_recv_entry *recv_queue;
 	uint32_t recv_size;
@@ -80,8 +80,10 @@ struct nex_qp {
 	pthread_t rx_thread;
 	uint32_t remote_qp_num;
 	uint32_t remote_lid;
-	pthread_mutex_t send_lock;
-	pthread_mutex_t rdma_lock;
+	pthread_spinlock_t send_lock;
+	uint8_t *send_buf;
+	size_t send_buf_capacity;
+	pthread_spinlock_t rdma_lock;
 	struct nex_pending_read *pending_reads;
 	pthread_mutex_t state_lock;
 	pthread_cond_t state_cond;
@@ -91,7 +93,7 @@ struct nex_qp {
 	
 	struct nex_pending_msg *pending_head;
 	struct nex_pending_msg *pending_tail;
-	pthread_mutex_t pending_lock;
+	pthread_spinlock_t pending_lock;
 
 	pthread_t connect_thread;
 };

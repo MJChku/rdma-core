@@ -1,5 +1,5 @@
 nex_kernel.o: \
- /home/jma/NEX/src/sims/ib/rdma-core/providers/nex/kernel/nex_kernel.c \
+ /home/jiacma/nex-dist/src/sims/ib/rdma-core/providers/nex/kernel/nex_kernel.c \
  include/linux/compiler-version.h include/linux/kconfig.h \
  include/generated/autoconf.h include/linux/compiler_types.h \
  include/linux/compiler_attributes.h include/linux/compiler-gcc.h \

@@ -1,7 +1,7 @@
 // nex_shm.c
+#define _GNU_SOURCE
 #include <sched.h>
 #include <stdlib.h>
-#define _GNU_SOURCE
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -18,33 +18,36 @@
 
 static int get_nex_id(void);
 
-#define DEBUG
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+// #define DEBUG
 #ifdef DEBUG
+#define NEX_TRACE_TIMING(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 #define NEX_TRACE(fmt, ...) fprintf(stderr, "nex_shm (%d): " fmt "\n", get_nex_id(), ##__VA_ARGS__)
 #else
+#define NEX_TRACE_TIMING(fmt, ...) do { } while (0)
 #define NEX_TRACE(fmt, ...) do { } while (0)
 #endif
 
-// extern void nex_virtual_speedup_start(int percentage);
-// extern void nex_virtual_speedup_end();
-// extern int send_data(uint32_t src_addr, uint32_t dst_addr, size_t len);
-// extern int recv_data(uint32_t src_addr, uint32_t dst_addr, size_t len);
+struct accvm_symbols accvm_syms = {0};
 
-typedef void (*nex_virtual_speedup_start_t)(int percentage);
-typedef void (*nex_virtual_speedup_end_t)(void);
-typedef int (*send_data_t)(uint32_t src_addr, uint32_t dst_addr, size_t len);
-typedef int (*recv_data_t)(uint32_t src_addr, uint32_t dst_addr, size_t len);
+static uint32_t parse_u32(const char* s)
+{
+    if (!s || !*s)
+        return 0;
+    errno = 0;
+    unsigned long v = strtoul(s, NULL, 0);
+    if (errno != 0)
+        return 0;
+    return (uint32_t)v;
+}
 
-struct accvm_symbols {
-    nex_virtual_speedup_start_t nex_virtual_speedup_start;
-    nex_virtual_speedup_end_t nex_virtual_speedup_end;
-    send_data_t send_data;
-    recv_data_t recv_data;
-};
-
-static struct accvm_symbols accvm_syms = {0};
-
-void* get_accvm_lib(){
+static void* get_accvm_lib(){
     void* handle = dlopen("accvm.so", RTLD_LAZY | RTLD_LOCAL);
     if (!handle) {
         fprintf(stderr, "Error loading libaccvm.so: %s\n", dlerror());
@@ -57,15 +60,20 @@ int get_accvm_symbols(struct accvm_symbols* syms) {
     void* handle = get_accvm_lib();
     if (!handle) return -1;
 
-    syms->nex_virtual_speedup_start = (nex_virtual_speedup_start_t)dlsym(handle, "nex_virtual_speedup_start");
-    if (!syms->nex_virtual_speedup_start) {
-        fprintf(stderr, "Error getting nex_virtual_speedup_start: %s\n", dlerror());
+    syms->compressT = (compressT_t)dlsym(handle, "compressT");
+    if (!syms->compressT) {
+        fprintf(stderr, "Error getting compressT: %s\n", dlerror());
     }
 
-    syms->nex_virtual_speedup_end = (nex_virtual_speedup_end_t)dlsym(handle, "nex_virtual_speedup_end");
-    if (!syms->nex_virtual_speedup_end) {
-        fprintf(stderr, "Error getting nex_virtual_speedup_end: %s\n", dlerror());
+    syms->jailbreakT = (jailbreakT_t)dlsym(handle, "jailbreakT");
+    if (!syms->jailbreakT) {
+        fprintf(stderr, "Error getting jailbreakT: %s\n", dlerror());
     }
+
+    syms->endJailbreakT = (end_jailbreakT_t)dlsym(handle, "endJailbreakT");
+    if (!syms->endJailbreakT) {
+        fprintf(stderr, "Error getting endJailbreakT: %s\n", dlerror());
+    } 
 
     syms->send_data = (send_data_t)dlsym(handle, "send_data");
     if (!syms->send_data) {
@@ -77,6 +85,18 @@ int get_accvm_symbols(struct accvm_symbols* syms) {
         fprintf(stderr, "Error getting recv_data: %s\n", dlerror());
     }
 
+    syms->send_data_qp = (send_data_qp_t)dlsym(handle, "send_data_qp");
+    if (!syms->send_data_qp) {
+        fprintf(stderr, "Error getting send_data_qp: %s\n", dlerror());
+    }
+
+    syms->recv_data_qp = (recv_data_qp_t)dlsym(handle, "recv_data_qp");
+    if (!syms->recv_data_qp) {
+        fprintf(stderr, "Error getting recv_data_qp: %s\n", dlerror());
+    }
+
+    if (!syms->send_data_qp || !syms->recv_data_qp)
+        return -1;
     return 0;
 }
 
@@ -92,9 +112,7 @@ void nex_fast_memcpy(void* dst, const void* src, size_t len) {
   // 1 us for using virtual speedup
   // 32KB 5 us
   if(len >= 32768){
-    // nex_virtual_speedup_start(4000);
     memcpy(dst, src, len);
-    // nex_virtual_speedup_end();
   }else{
     memcpy(dst, src, len);
   }
@@ -141,6 +159,10 @@ struct nex_shm_conn {
   struct shm_ring rx;  // read from here (local <lid:qp>)
   struct shm_ring tx;  // write to here (remote <lid:qp>)
   int             in_use;
+  uint32_t        local_lid;
+  uint32_t        remote_lid;
+  uint32_t        local_qp;
+  uint32_t        remote_qp;
 };
 
 #ifndef NEX_SHM_MAX_CONN
@@ -255,7 +277,6 @@ static int open_local_ring(const char* name, uint64_t bytes, struct shm_ring* ou
   out->fd = fd;
   out->map_len = map_len;
 
-  get_accvm_symbols(&accvm_syms);
   return 0;
 }
 
@@ -349,6 +370,10 @@ int nex_shm_dial(const char* service_id, int* fd_out) {
   }
   
   struct nex_shm_conn* c = conn_get(fd);
+  c->local_lid = parse_u32(llid);
+  c->remote_lid = parse_u32(rlid);
+  c->local_qp = parse_u32(lqp);
+  c->remote_qp = parse_u32(rqp);
 
   const uint32_t ring_bytes = 40 * 1024 * 1024; // 40MB per direction
   
@@ -377,7 +402,9 @@ int nex_shm_dial(const char* service_id, int* fd_out) {
 }
 
 
-ssize_t nex_shm_read(int fd, void* buf, size_t len) {
+ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
+  
+  apply_perf_model = 0;
   struct nex_shm_conn* c = conn_get(fd);
   if (!c) { errno = EBADF; return -1; }
   if (len == 0) return 0;
@@ -385,8 +412,6 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len) {
   struct shm_ring_hdr* h = c->rx.h;
   size_t done = 0;
   int iter = 0;
-
-   accvm_syms.recv_data(0, 0, len);
 
   while (done < len) {
 
@@ -403,11 +428,12 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len) {
         // pthread_mutex_unlock(&h->lock);
         return -1;
       }
-      // NEX_TRACE("nex_shm_read waiting for data (iter=%d) need=%lu done=%lu head=%lu tail=%lu", iter++, (unsigned long)(len - done), (unsigned long)done, (unsigned long)head, (unsigned long)tail);
       // pthread_mutex_unlock(&h->lock);
       yield();
       continue;
     }
+
+    NEX_TRACE_TIMING("nex_shm_read data (iter=%d) need=%lu done=%lu head=%lu tail=%lu", iter++, (unsigned long)(len - done), (unsigned long)done, (unsigned long)head, (unsigned long)tail);
 
     size_t need = len - done;
     size_t to_read = (size_t)avail < need ? (size_t)avail : need;
@@ -426,11 +452,18 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len) {
     done += to_read;
   }
 
+  if (apply_perf_model) {
+    accvm_syms.recv_data_qp(c->remote_lid, c->local_lid, len, c->remote_qp, c->local_qp);
+  }
+
   return (ssize_t)done; // == len
 }
 
 /* Block until exactly len bytes are written, or error. Returns len on success, -1 on error (errno set). */
-ssize_t nex_shm_write(int fd, const void* buf, size_t len) {
+ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model) {
+  
+  apply_perf_model = 0;
+
   struct nex_shm_conn* c = conn_get(fd);
   if (!c) { errno = EBADF; return -1; }
   if (len == 0) return 0;
@@ -439,8 +472,6 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len) {
 
   size_t done = 0;
   int iter = 0;
-
-  accvm_syms.send_data(0, 0, len);
 
   while (done < len) {
     // pthread_mutex_lock(&h->lock);
@@ -463,6 +494,9 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len) {
       continue;
     }
 
+    NEX_TRACE_TIMING("nex_shm_write data (iter=%d) need=%lu done=%lu head=%lu tail=%lu", iter++, (unsigned long)(len - done), (unsigned long)done, (unsigned long)head, (unsigned long)tail);
+
+    
     size_t need = len - done;
     size_t to_write = (size_t)free_bytes < need ? (size_t)free_bytes : need;
 
@@ -478,6 +512,10 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len) {
     __atomic_store_n(&h->head, head + (uint64_t)to_write, __ATOMIC_RELEASE);
     // pthread_mutex_unlock(&h->lock);
     done += to_write;
+  }
+
+  if (apply_perf_model) {
+    accvm_syms.send_data_qp(c->local_lid, c->remote_lid, len, c->local_qp, c->remote_qp);
   }
 
   return (ssize_t)done; // == len

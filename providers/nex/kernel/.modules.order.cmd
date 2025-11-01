@@ -1,1 +1,1 @@
-savedcmd_/home/jma/NEX/src/sims/ib/rdma-core/providers/nex/kernel/modules.order := {   echo /home/jma/NEX/src/sims/ib/rdma-core/providers/nex/kernel/nex_kernel.o; :; } > /home/jma/NEX/src/sims/ib/rdma-core/providers/nex/kernel/modules.order
+savedcmd_/home/jiacma/nex-dist/src/sims/ib/rdma-core/providers/nex/kernel/modules.order := {   echo /home/jiacma/nex-dist/src/sims/ib/rdma-core/providers/nex/kernel/nex_kernel.o; :; } > /home/jiacma/nex-dist/src/sims/ib/rdma-core/providers/nex/kernel/modules.order

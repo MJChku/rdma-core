@@ -78,20 +78,30 @@ int nex_cm_exchange(const char *service_id,
 	if (!peer || !role)
 		return EINVAL;
 
-	if (getaddrinfo(NEX_CM_SERVICE_HOST, NEX_CM_SERVICE_PORT, &hints, &res))
+	fprintf(stderr, "nex_cm: connecting to CM server %s:%s for service=%s qp=%u port=%u\n",
+		NEX_CM_SERVICE_HOST, NEX_CM_SERVICE_PORT, service_id, local_qp_num, listen_port);
+
+	if (getaddrinfo(NEX_CM_SERVICE_HOST, NEX_CM_SERVICE_PORT, &hints, &res)) {
+		fprintf(stderr, "nex_cm: getaddrinfo FAILED errno=%d\n", errno);
 		return errno ? errno : EIO;
+	}
 	for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
 		fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 		if (fd < 0)
 			continue;
-		if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+		fprintf(stderr, "nex_cm: attempting connect fd=%d\n", fd);
+		if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+			fprintf(stderr, "nex_cm: connect SUCCESS fd=%d\n", fd);
 			break;
+		}
+		fprintf(stderr, "nex_cm: connect FAILED fd=%d errno=%d\n", fd, errno);
 		close(fd);
 		fd = -1;
 	}
 	freeaddrinfo(res);
 	if (fd < 0) {
 		err = errno ? errno : EIO;
+		fprintf(stderr, "nex_cm: all connect attempts FAILED err=%d\n", err);
 		goto out;
 	}
 
@@ -99,14 +109,18 @@ int nex_cm_exchange(const char *service_id,
 	strncpy(req.service_id, service_id, sizeof(req.service_id) - 1);
 	req.qp_num = htonl(local_qp_num);
 	req.listen_port = htons(listen_port);
+	fprintf(stderr, "nex_cm: sending request\n");
 	if (send_all(fd, &req, sizeof(req))) {
 		err = errno ? errno : EIO;
+		fprintf(stderr, "nex_cm: send_all FAILED err=%d\n", err);
 		goto out;
 	}
 
+	fprintf(stderr, "nex_cm: waiting for response\n");
 	struct nex_cm_rsp rsp;
 	if (recv_all(fd, &rsp, sizeof(rsp))) {
 		err = errno ? errno : EIO;
+		fprintf(stderr, "nex_cm: recv_all FAILED err=%d\n", err);
 		goto out;
 	}
 
@@ -116,6 +130,8 @@ int nex_cm_exchange(const char *service_id,
 	strncpy(peer->host, rsp.peer_host, sizeof(peer->host) - 1);
 	peer->host[sizeof(peer->host) - 1] = '\0';
 	*role = rsp.role;
+	fprintf(stderr, "nex_cm: SUCCESS peer_qp=%u peer_port=%u role=%d host=%s\n",
+		peer->qp_num, peer->port, *role, peer->host);
 	err = 0;
 
 out:

@@ -30,10 +30,20 @@
 
 static int get_nex_id(void);
 
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 // #define DEBUG
+
 #ifdef DEBUG
-#define NEX_TRACE(fmt, ...) fprintf(stderr, "nex (%d): " fmt "\n", get_nex_id(), ##__VA_ARGS__)
+#define NEX_TRACE_TIMING(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
+#define NEX_TRACE(fmt, ...) fprintf(stderr, "nex (%d, %lu ms): " fmt "\n", get_nex_id(), now_ns() / 1000000, ##__VA_ARGS__)
 #else
+#define NEX_TRACE_TIMING(fmt, ...) do { } while (0)
 #define NEX_TRACE(fmt, ...) do { } while (0)
 #endif
 
@@ -116,7 +126,7 @@ static inline uint32_t nex_next_key(struct nex_context *ctx)
 	return 0x1000 + key;
 }
 
-static int nex_write_full(int fd, const void *buf, size_t len)
+static int nex_write_full(int fd, const void *buf, size_t len, int apply_perf)
 {
 #ifdef USE_TCP
 	const uint8_t *p = buf;
@@ -133,7 +143,7 @@ static int nex_write_full(int fd, const void *buf, size_t len)
 		len -= (size_t)n;
 	}
 #else
-	ssize_t n = nex_shm_write(fd, buf, len);
+	ssize_t n = nex_shm_write(fd, buf, len, apply_perf);
 	if (n != len) {
 		NEX_TRACE("nex_shm_write failed n=%zd len=%zu errno=%d", n, len, errno);
 		return -1;
@@ -143,7 +153,7 @@ static int nex_write_full(int fd, const void *buf, size_t len)
 	return 0;
 }
 
-static int nex_read_full(int fd, void *buf, size_t len)
+static int nex_read_full(int fd, void *buf, size_t len, int apply_perf)
 {
 #ifdef USE_TCP
 	uint8_t *p = buf;
@@ -160,7 +170,7 @@ static int nex_read_full(int fd, void *buf, size_t len)
 		len -= (size_t)n;
 	}
 #else 
-	ssize_t n = nex_shm_read(fd, buf, len);
+	ssize_t n = nex_shm_read(fd, buf, len, apply_perf);
 	if (n != len) return -1;
 #endif
 	return 0;
@@ -195,12 +205,12 @@ static int nex_map_qp_counter(struct nex_context *ctx)
 
 static void nex_cq_push(struct nex_cq *cq, const struct ibv_wc *wc)
 {
-	pthread_mutex_lock(&cq->lock);
+	pthread_spin_lock(&cq->lock);
 	uint32_t next_tail = (cq->tail + 1) % cq->capacity;
 	if (next_tail == cq->head) {
 		/* Drop completion on overflow */
-		pthread_mutex_unlock(&cq->lock);
-		NEX_TRACE("cq overflow dropping completion wr_id=%" PRIu64,
+		pthread_spin_unlock(&cq->lock);
+		NEX_TRACE("WARNING: cq overflow dropping completion wr_id=%" PRIu64,
 			(uint64_t)wc->wr_id);
 		return;
 	}
@@ -209,19 +219,21 @@ static void nex_cq_push(struct nex_cq *cq, const struct ibv_wc *wc)
        NEX_TRACE("cq_push wr_id=%" PRIu64 " opcode=%u status=%u len=%u qp_local=%u",
 	       (uint64_t)wc->wr_id, wc->opcode, wc->status, wc->byte_len,
 	       wc->qp_num);
-	pthread_cond_signal(&cq->cond);
-	pthread_mutex_unlock(&cq->lock);
+	pthread_spin_unlock(&cq->lock);
 }
 
 static int nex_cq_pop(struct nex_cq *cq, int num_entries, struct ibv_wc *wc)
 {
 	int produced = 0;
-	pthread_mutex_lock(&cq->lock);
+	accvm_syms.compressT(1000.0f);
+	pthread_spin_lock(&cq->lock);
 	while (produced < num_entries && cq->head != cq->tail) {
 		wc[produced++] = cq->entries[cq->head];
 		cq->head = (cq->head + 1) % cq->capacity;
 	}
-	pthread_mutex_unlock(&cq->lock);
+	pthread_spin_unlock(&cq->lock);
+	accvm_syms.compressT(1.0f);
+	NEX_TRACE_TIMING("nex_cq_pop produced=%d/%d", produced, num_entries);
 	return produced;
 }
 
@@ -242,17 +254,22 @@ static int nex_qp_wait_connected(struct nex_qp *qp);
 static int nex_qp_reserve(struct nex_qp *qp);
 static void nex_qp_release(struct nex_qp *qp);
 
+static bool nex_qp_has_peer_addr(const struct nex_qp *qp)
+{
+	return qp->remote_qp_num != 0 && qp->remote_lid != 0;
+}
+
 static bool nex_try_take_recv(struct nex_qp *qp, struct nex_recv_entry *out)
 {
     bool ok = false;
-    pthread_mutex_lock(&qp->lock);
+    pthread_spin_lock(&qp->lock);
     if (qp->recv_head != qp->recv_tail) {
         struct nex_recv_entry *entry = &qp->recv_queue[qp->recv_head];
         qp->recv_head = (qp->recv_head + 1) % qp->recv_size;
         *out = *entry;
         ok = true;
     }
-    pthread_mutex_unlock(&qp->lock);
+    pthread_spin_unlock(&qp->lock);
     return ok;
 }
 
@@ -268,32 +285,32 @@ static void nex_push_pending_msg(struct nex_qp *qp, const struct nex_msg_hdr *hd
 	msg->payload = payload;
 	msg->payload_len = payload_len;
 	msg->next = NULL;
-	pthread_mutex_lock(&qp->pending_lock);
+	pthread_spin_lock(&qp->pending_lock);
 	if (qp->pending_tail)
 		qp->pending_tail->next = msg;
 	else
 		qp->pending_head = msg;
 	qp->pending_tail = msg;
-	pthread_mutex_unlock(&qp->pending_lock);
+	pthread_spin_unlock(&qp->pending_lock);
 }
 
 static struct nex_pending_msg *nex_pop_pending_msg(struct nex_qp *qp) {
 	struct nex_pending_msg *msg = NULL;
-	pthread_mutex_lock(&qp->pending_lock);
+	pthread_spin_lock(&qp->pending_lock);
 	if (qp->pending_head) {
 		msg = qp->pending_head;
 		qp->pending_head = msg->next;
 		if (qp->pending_head == NULL)
 			qp->pending_tail = NULL;
 	}
-	pthread_mutex_unlock(&qp->pending_lock);
+	pthread_spin_unlock(&qp->pending_lock);
 	return msg;
 }
 
 static struct nex_mr *nex_find_mr(struct nex_context *ctx, uint32_t rkey)
 {
 	struct nex_mr *mr = NULL;
-	pthread_mutex_lock(&ctx->mr_lock);
+	pthread_spin_lock(&ctx->mr_lock);
 	int count_match = 0;
 	for (struct nex_mr *iter = ctx->mr_list; iter; iter = iter->next) {
 		if (iter->vmr.ibv_mr.rkey == rkey) {
@@ -301,13 +318,13 @@ static struct nex_mr *nex_find_mr(struct nex_context *ctx, uint32_t rkey)
 				mr = iter;
 			}
 			count_match++;
-			// break;
+			break;
 		}
 	}
-	pthread_mutex_unlock(&ctx->mr_lock);
+	pthread_spin_unlock(&ctx->mr_lock);
 
 	if(count_match > 1){
-		NEX_TRACE("!! ERROR: rkey=%u matched %d MRs, returning first match", rkey, count_match);
+		fprintf(stderr, "!! ERROR: rkey=%u matched %d MRs, returning first match", rkey, count_match);
 	}
 	return mr;
 }
@@ -326,10 +343,10 @@ static int nex_add_pending_read(struct nex_qp *qp, uint64_t wr_id,
 	entry->total_len = total_len;
 	for (int i = 0; i < num_sge; ++i)
 		entry->sge[i] = sg_list[i];
-	pthread_mutex_lock(&qp->rdma_lock);
+	pthread_spin_lock(&qp->rdma_lock);
 	entry->next = qp->pending_reads;
 	qp->pending_reads = entry;
-	pthread_mutex_unlock(&qp->rdma_lock);
+	pthread_spin_unlock(&qp->rdma_lock);
 	return 0;
 }
 
@@ -337,7 +354,7 @@ static struct nex_pending_read *nex_take_pending_read(struct nex_qp *qp,
 					       uint64_t wr_id)
 {
 	struct nex_pending_read *entry = NULL;
-	pthread_mutex_lock(&qp->rdma_lock);
+	pthread_spin_lock(&qp->rdma_lock);
 	struct nex_pending_read **prev = &qp->pending_reads;
 	while (*prev && (*prev)->wr_id != wr_id)
 		prev = &(*prev)->next;
@@ -345,7 +362,7 @@ static struct nex_pending_read *nex_take_pending_read(struct nex_qp *qp,
 		entry = *prev;
 		*prev = entry->next;
 	}
-	pthread_mutex_unlock(&qp->rdma_lock);
+	pthread_spin_unlock(&qp->rdma_lock);
 	return entry;
 }
 
@@ -353,14 +370,14 @@ static int nex_send_msg(struct nex_qp *qp, const struct nex_msg_hdr *hdr,
 			    const void *payload, size_t payload_len)
 {
 	int rc = 0;
-	pthread_mutex_lock(&qp->send_lock);
-	if (nex_write_full(qp->tx_fd, hdr, sizeof(*hdr)))
+	pthread_spin_lock(&qp->send_lock);
+	if (nex_write_full(qp->tx_fd, hdr, sizeof(*hdr), 0))  // header: no perf model
 		rc = errno ? errno : EIO;
 	if (!rc && payload_len) {
-		if (nex_write_full(qp->tx_fd, payload, payload_len))
+		if (nex_write_full(qp->tx_fd, payload, payload_len, 1))  // payload: apply perf model
 			rc = errno ? errno : EIO;
 	}
-	pthread_mutex_unlock(&qp->send_lock);
+	pthread_spin_unlock(&qp->send_lock);
 	return rc;
 }
 
@@ -488,10 +505,10 @@ static struct ibv_mr *nex_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 	(void)hca_va;
 	(void)access;
 	mr->next = NULL;
-	pthread_mutex_lock(&ctx->mr_lock);
+	pthread_spin_lock(&ctx->mr_lock);
 	mr->next = ctx->mr_list;
 	ctx->mr_list = mr;
-	pthread_mutex_unlock(&ctx->mr_lock);
+	pthread_spin_unlock(&ctx->mr_lock);
 	NEX_TRACE("reg_mr addr=%p len=%zu lkey=%u rkey=%u",
 		addr, length, mr->vmr.ibv_mr.lkey, mr->vmr.ibv_mr.rkey);
 	return &mr->vmr.ibv_mr;
@@ -510,13 +527,13 @@ static int nex_dereg_mr(struct verbs_mr *vmr)
 {
 	struct nex_mr *mr = container_of(vmr, struct nex_mr, vmr);
 	struct nex_context *ctx = to_nctx(vmr->ibv_mr.context);
-	pthread_mutex_lock(&ctx->mr_lock);
+	pthread_spin_lock(&ctx->mr_lock);
 	struct nex_mr **prev = &ctx->mr_list;
 	while (*prev && *prev != mr)
 		prev = &(*prev)->next;
 	if (*prev == mr)
 		*prev = mr->next;
-	pthread_mutex_unlock(&ctx->mr_lock);
+	pthread_spin_unlock(&ctx->mr_lock);
 	free(mr);
 	return 0;
 }
@@ -535,16 +552,20 @@ static struct ibv_cq *nex_create_cq(struct ibv_context *context, int cqe,
 	if (cqe <= 0)
 		cqe = 1;
 
-	cq->entries = calloc(cqe, sizeof(*cq->entries));
+	/*
+	 * Maintain an extra slot so the ring buffer can store the requested
+	 * number of CQEs without hitting the overflow guard.
+	 */
+	size_t ring_capacity = (size_t)cqe + 1;
+	cq->entries = calloc(ring_capacity, sizeof(*cq->entries));
 	if (!cq->entries) {
 		free(cq);
 		return NULL;
 	}
 
-	cq->capacity = cqe;
+	cq->capacity = ring_capacity;
 	cq->head = cq->tail = 0;
-	pthread_mutex_init(&cq->lock, NULL);
-	pthread_cond_init(&cq->cond, NULL);
+	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
 
 	verbs_init_cq(&cq->vcq.cq, context, channel, NULL);
 	cq->vcq.cq.handle = nex_next_handle(ctx);
@@ -556,8 +577,7 @@ static struct ibv_cq *nex_create_cq(struct ibv_context *context, int cqe,
 static int nex_destroy_cq(struct ibv_cq *ibcq)
 {
 	struct nex_cq *cq = to_ncq(ibcq);
-	pthread_mutex_destroy(&cq->lock);
-	pthread_cond_destroy(&cq->cond);
+	pthread_spin_destroy(&cq->lock);
 	free(cq->entries);
 	free(cq);
 	return 0;
@@ -613,10 +633,11 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 		return NULL;
 	}
 	qp->recv_head = qp->recv_tail = 0;
-	pthread_mutex_init(&qp->lock, NULL);
-	pthread_cond_init(&qp->recv_cond, NULL);
-	pthread_mutex_init(&qp->send_lock, NULL);
-	pthread_mutex_init(&qp->rdma_lock, NULL);
+	pthread_spin_init(&qp->lock, PTHREAD_PROCESS_PRIVATE);
+	pthread_spin_init(&qp->send_lock, PTHREAD_PROCESS_PRIVATE);
+	qp->send_buf = NULL;
+	qp->send_buf_capacity = 0;
+	pthread_spin_init(&qp->rdma_lock, PTHREAD_PROCESS_PRIVATE);
 	qp->pending_reads = NULL;
 	pthread_mutex_init(&qp->state_lock, NULL);
 	pthread_cond_init(&qp->state_cond, NULL);
@@ -629,7 +650,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
     qp->connect_thread_valid = false;
 
 	qp->pending_head = qp->pending_tail = NULL;
-	pthread_mutex_init(&qp->pending_lock, NULL);
+	pthread_spin_init(&qp->pending_lock, PTHREAD_PROCESS_PRIVATE);
 
 	qp->ctx = ctx;
 	qp->send_cq = send_cq;
@@ -651,13 +672,12 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 	pthread_cond_init(&qp->vqp.qp.cond, NULL);
 
     if (nex_qp_reserve(qp)) {
-        pthread_mutex_destroy(&qp->lock);
-        pthread_cond_destroy(&qp->recv_cond);
-        pthread_mutex_destroy(&qp->send_lock);
-        pthread_mutex_destroy(&qp->rdma_lock);
+        pthread_spin_destroy(&qp->lock);
+        pthread_spin_destroy(&qp->send_lock);
+        pthread_spin_destroy(&qp->rdma_lock);
         pthread_mutex_destroy(&qp->state_lock);
         pthread_cond_destroy(&qp->state_cond);
-        pthread_mutex_destroy(&qp->pending_lock);
+        pthread_spin_destroy(&qp->pending_lock);
         pthread_mutex_destroy(&qp->vqp.qp.mutex);
         pthread_cond_destroy(&qp->vqp.qp.cond);
         free(qp->recv_queue);
@@ -674,10 +694,9 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
     struct nex_qp *qp = to_nqp(ibqp);
     nex_qp_release(qp);
     if (qp->rx_running) {
-        pthread_mutex_lock(&qp->lock);
+        pthread_spin_lock(&qp->lock);
         qp->rx_running = false;
-		pthread_cond_broadcast(&qp->recv_cond);
-		pthread_mutex_unlock(&qp->lock);
+		pthread_spin_unlock(&qp->lock);
 		#ifdef USE_TCP
 		if (qp->rx_fd >= 0)
 			shutdown(qp->rx_fd, SHUT_RDWR);
@@ -707,10 +726,10 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 		qp->rx_fd = -1;
 	}
 	#endif
-	pthread_mutex_destroy(&qp->lock);
-	pthread_cond_destroy(&qp->recv_cond);
-	pthread_mutex_destroy(&qp->send_lock);
-	pthread_mutex_lock(&qp->rdma_lock);
+	pthread_spin_destroy(&qp->lock);
+	pthread_spin_destroy(&qp->send_lock);
+	free(qp->send_buf);
+	pthread_spin_lock(&qp->rdma_lock);
 	struct nex_pending_read *pending = qp->pending_reads;
 	while (pending) {
 		struct nex_pending_read *next = pending->next;
@@ -718,8 +737,8 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 		pending = next;
 	}
 	qp->pending_reads = NULL;
-	pthread_mutex_unlock(&qp->rdma_lock);
-	pthread_mutex_destroy(&qp->rdma_lock);
+	pthread_spin_unlock(&qp->rdma_lock);
+	pthread_spin_destroy(&qp->rdma_lock);
 	if (qp->connect_thread_valid) {
 		pthread_join(qp->connect_thread, NULL);
 		qp->connect_thread_valid = false;
@@ -728,7 +747,7 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 	pthread_cond_destroy(&qp->state_cond);
 	pthread_mutex_destroy(&qp->vqp.qp.mutex);
 	pthread_cond_destroy(&qp->vqp.qp.cond);
-	pthread_mutex_lock(&qp->pending_lock);
+	pthread_spin_lock(&qp->pending_lock);
 	struct nex_pending_msg *pmsg = qp->pending_head;
 	while (pmsg) {
 		struct nex_pending_msg *next = pmsg->next;
@@ -737,8 +756,8 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 		pmsg = next;
 	}
 	qp->pending_head = qp->pending_tail = NULL;
-	pthread_mutex_unlock(&qp->pending_lock);
-	pthread_mutex_destroy(&qp->pending_lock);
+	pthread_spin_unlock(&qp->pending_lock);
+	pthread_spin_destroy(&qp->pending_lock);
 	free(qp->recv_queue);
     free(qp);
     return 0;
@@ -773,26 +792,43 @@ Most applications only care about INIT → RTR → RTS.
 static int nex_modify_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
 			 int attr_mask)
 {
-	fprintf(stderr, "nex: modify_qp qpn=%u mask=0x%x state=%d\n",
+	NEX_TRACE("modify_qp qpn=%u mask=0x%x state=%d\n",
 		ibqp->qp_num, attr_mask,
 		(attr_mask & IBV_QP_STATE) ? attr->qp_state : -1);
 		
 	struct nex_qp *qp = to_nqp(ibqp);
+	bool retry_connect = false;
 
-	if (attr_mask & IBV_QP_DEST_QPN){
+	if (attr_mask & IBV_QP_DEST_QPN) {
 		qp->remote_qp_num = attr->dest_qp_num;
 		qp->remote_lid = attr->ah_attr.dlid;
 		NEX_TRACE("modify_qp remote_lid=%u; dest_qpn=%u; qp_pair=%u:%u", attr->ah_attr.dlid, attr->dest_qp_num, qp->vqp.qp.qp_num, qp->remote_qp_num);
+		pthread_mutex_lock(&qp->state_lock);
+		pthread_cond_broadcast(&qp->state_cond);
+		bool should_connect = !qp->connect_in_progress && qp->tx_fd < 0 && nex_qp_has_peer_addr(qp);
+		if (should_connect) {
+			pthread_mutex_unlock(&qp->state_lock);
+			int rc = nex_qp_start_connect(qp);
+			if (rc && rc != EAGAIN) {
+				errno = rc;
+				return rc;
+			}
+		} else {
+			pthread_mutex_unlock(&qp->state_lock);
+		}
 	}
 
 	if (attr_mask & IBV_QP_STATE) {
 		qp->vqp.qp.state = attr->qp_state;
 		if (attr->qp_state == IBV_QPS_RTS) {
 			int rc = nex_qp_start_connect(qp);
-			if (rc) {
+			if (rc && rc != EAGAIN) {
+				NEX_TRACE("modify_qp start_connect FAILED rc=%d", rc);
 				errno = rc;
 				return rc;
 			}
+			if (!rc)
+				NEX_TRACE("modify_qp start_connect returned OK");
 		}
 	}
 
@@ -839,6 +875,12 @@ static int nex_qp_start_connect(struct nex_qp *qp)
 		pthread_mutex_unlock(&qp->state_lock);
 		return 0;
 	}
+	if (!nex_qp_has_peer_addr(qp)) {
+		qp->connect_status = EAGAIN;
+		pthread_cond_broadcast(&qp->state_cond);
+		pthread_mutex_unlock(&qp->state_lock);
+		return EAGAIN;
+	}
 	qp->connect_in_progress = true;
 	qp->connect_status = EINPROGRESS;
 	pthread_mutex_unlock(&qp->state_lock);
@@ -859,29 +901,46 @@ static int nex_qp_start_connect(struct nex_qp *qp)
 
 static int nex_qp_wait_connected(struct nex_qp *qp)
 {
-	int rc = nex_qp_start_connect(qp);
-	if (rc)
-		return rc;
+	for (;;) {
+		int rc = nex_qp_start_connect(qp);
+		if (rc && rc != EAGAIN)
+			return rc;
 
-	pthread_mutex_lock(&qp->state_lock);
-	while (qp->tx_fd < 0 && qp->connect_in_progress)
-		pthread_cond_wait(&qp->state_cond, &qp->state_lock);
-	if (qp->tx_fd >= 0)
-		rc = 0;
-	else
-		rc = qp->connect_status ? qp->connect_status : EIO;
-	pthread_mutex_unlock(&qp->state_lock);
-	return rc;
+		pthread_mutex_lock(&qp->state_lock);
+		while (qp->tx_fd < 0 && qp->connect_in_progress)
+			pthread_cond_wait(&qp->state_cond, &qp->state_lock);
+		if (qp->tx_fd >= 0) {
+			pthread_mutex_unlock(&qp->state_lock);
+			return 0;
+		}
+
+		rc = qp->connect_status;
+		if (rc == EAGAIN && !nex_qp_has_peer_addr(qp)) {
+			while (!nex_qp_has_peer_addr(qp))
+				pthread_cond_wait(&qp->state_cond, &qp->state_lock);
+			pthread_mutex_unlock(&qp->state_lock);
+			continue;
+		}
+
+		if (!rc)
+			rc = EIO;
+		pthread_mutex_unlock(&qp->state_lock);
+		return rc;
+	}
 }
 
 static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 			 struct ibv_recv_wr **bad_wr)
 {
+
 	struct nex_qp *qp = to_nqp(ibqp);
 
 	// iterate through work requests (wr)
 	// wr has next and sg_list (scatter-gather list)
 	// each sg_list has addr, length, lkey
+	accvm_syms.compressT(1000.0f);
+	NEX_TRACE_TIMING("nex_post_recv produced");
+
 	for (; wr; wr = wr->next) {
 		if (wr->num_sge > 1) {
 			if (bad_wr)
@@ -895,10 +954,10 @@ static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 		       (uint64_t)wr->wr_id, wr->num_sge,
 		       wr->num_sge ? wr->sg_list[0].length : 0U,
 		       qp->vqp.qp.qp_num);
-		pthread_mutex_lock(&qp->lock);
+		pthread_spin_lock(&qp->lock);
 		uint32_t next_tail = (qp->recv_tail + 1) % qp->recv_size;
 		if (next_tail == qp->recv_head) {
-			pthread_mutex_unlock(&qp->lock);
+			pthread_spin_unlock(&qp->lock);
 			if (bad_wr)
 				*bad_wr = wr;
 			NEX_TRACE("ERROR: post_recv queue full");
@@ -912,9 +971,9 @@ static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 		else
 			memset(&entry->sge, 0, sizeof(entry->sge));
 		qp->recv_tail = next_tail;
-		pthread_cond_signal(&qp->recv_cond);
-		pthread_mutex_unlock(&qp->lock);
+		pthread_spin_unlock(&qp->lock);
 	}
+	accvm_syms.compressT(1.0f);
 	return 0;
 }
 
@@ -922,6 +981,9 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			 struct ibv_send_wr **bad_wr)
 {
 	struct nex_qp *qp = to_nqp(ibqp);
+
+	accvm_syms.compressT(1000.0f);
+	NEX_TRACE_TIMING("nex_post_send produced");
 
 	if (qp->vqp.qp.state != IBV_QPS_RTS) {
 		if (bad_wr)
@@ -958,7 +1020,7 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			if (bad_wr) *bad_wr = wr;
 			errno = EINVAL;
 			NEX_TRACE("ERROR: post_send num_sge=%d unsupported\n", wr->num_sge);
-			return EINVAL;
+			goto ERROR_OUT;
 		}
 
 		size_t total_len = 0;
@@ -1008,7 +1070,7 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					*bad_wr = wr;
 				errno = rc;
 				NEX_TRACE("ERROR: post_send add_pending_read failed");
-				return rc;
+				goto ERROR_OUT;
 			}
 			break;
 		default:
@@ -1016,23 +1078,32 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				*bad_wr = wr;
 			errno = ENOTSUP;
 			NEX_TRACE("ERROR: post_send opcode=%d unsupported\n", wr->opcode);
-			return ENOTSUP;
+			goto ERROR_OUT;
 		}
 
 		if (wr->opcode == IBV_WR_SEND ||
 		    wr->opcode == IBV_WR_RDMA_WRITE ||
 		    wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM) {
 			if (total_len) {
-				tmp = malloc(total_len);
-				if (!tmp) {
-					if (bad_wr)
-						*bad_wr = wr;
-					errno = ENOMEM;
-					return ENOMEM;
+				// Reuse or grow send buffer
+				if (total_len > qp->send_buf_capacity) {
+					size_t new_capacity = total_len;
+					if (new_capacity < 4096)
+						new_capacity = 4096;
+					uint8_t *new_buf = realloc(qp->send_buf, new_capacity);
+					if (!new_buf) {
+						if (bad_wr)
+							*bad_wr = wr;
+						errno = ENOMEM;
+						goto ERROR_OUT;
+					}
+					qp->send_buf = new_buf;
+					qp->send_buf_capacity = new_capacity;
 				}
+				tmp = qp->send_buf;
 				size_t off = 0;
 				for (int i = 0; i < wr->num_sge; ++i) {
-					nex_fast_memcpy(tmp + off, (void *)(uintptr_t)wr->sg_list[i].addr,
+					memcpy(tmp + off, (void *)(uintptr_t)wr->sg_list[i].addr,
 					       wr->sg_list[i].length);
 					off += wr->sg_list[i].length;
 				}
@@ -1040,8 +1111,6 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		}
 
 		rc = nex_send_msg(qp, &hdr, tmp, payload_len);
-		if (tmp)
-			free(tmp);
 		if (rc) {
 			if (wr->opcode == IBV_WR_RDMA_READ) {
 				struct nex_pending_read *entry =
@@ -1052,7 +1121,7 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				*bad_wr = wr;
 			errno = rc;
 			NEX_TRACE("ERROR: post_send send_msg failed");
-			return rc;
+			goto ERROR_OUT;
 		}
 
 	    NEX_TRACE("send wr_id=%" PRIu64 " opcode=%u len=%zu qp_pair=%u:%u",
@@ -1080,21 +1149,39 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		}
 	}
 
+	accvm_syms.compressT(1.0f);
 	return 0;
+
+ERROR_OUT:
+	accvm_syms.compressT(1.0f);
+	return errno;
 }
 
 static void *nex_rx_worker(void *arg)
 {
+	
+	accvm_syms.compressT(1000.0f);
+
 	struct nex_qp *qp = arg;
+	uint8_t *payload_buf = NULL;
+	size_t payload_capacity = 0;
+	const size_t initial_capacity = 4096;
+	struct nex_msg_hdr hdr;
+	uint8_t *payload;
+	size_t payload_len;
+	bool payload_from_pending;
+
 	for (;;) {
-		struct nex_msg_hdr hdr;
-		uint8_t *payload = NULL;
-		size_t payload_len = 0;
+		payload = NULL;
+		payload_len = 0;
+		payload_from_pending = false;
+		
 		struct nex_pending_msg *pending = nex_pop_pending_msg(qp);
 		if (pending) {
 			hdr = pending->hdr;
 			payload = pending->payload;
 			payload_len = pending->payload_len;
+			payload_from_pending = true;
 			   NEX_TRACE("replay pending hdr wr_id=%" PRIu64 " opcode=%u len=%u status=%u qp_pair=%u:%u",
 				   hdr.wr_id, hdr.opcode, hdr.length, hdr.status,
 				   qp->vqp.qp.qp_num, qp->remote_qp_num);
@@ -1103,7 +1190,7 @@ static void *nex_rx_worker(void *arg)
 			// get header then get payload
 			if (!qp->rx_running)
 				break;
-			if (nex_read_full(qp->rx_fd, &hdr, sizeof(hdr)))
+			if (nex_read_full(qp->rx_fd, &hdr, sizeof(hdr), 0))  // header: no perf model
 				break;
 
 			bool expect_payload = (hdr.opcode == NEX_MSG_SEND ||
@@ -1116,13 +1203,20 @@ static void *nex_rx_worker(void *arg)
 				   qp->vqp.qp.qp_num, qp->remote_qp_num);
 
 			if (expect_payload && hdr.length) {
-				payload = malloc(hdr.length);
-				if (!payload)
-					break;
-				if (nex_read_full(qp->rx_fd, payload, hdr.length)) {
-					free(payload);
-					break;
+				// Reuse or grow buffer
+				if (hdr.length > payload_capacity) {
+					size_t new_capacity = hdr.length;
+					if (new_capacity < initial_capacity)
+						new_capacity = initial_capacity;
+					uint8_t *new_buf = realloc(payload_buf, new_capacity);
+					if (!new_buf)
+						break;
+					payload_buf = new_buf;
+					payload_capacity = new_capacity;
 				}
+				if (nex_read_full(qp->rx_fd, payload_buf, hdr.length, 1))  // payload: apply perf model
+					break;
+				payload = payload_buf;
 				payload_len = hdr.length;
 				   NEX_TRACE("read completed: rx payload wr_id=%" PRIu64 " len=%u qp_pair=%u:%u",
 					   hdr.wr_id, hdr.length, qp->vqp.qp.qp_num, qp->remote_qp_num);
@@ -1155,7 +1249,7 @@ static void *nex_rx_worker(void *arg)
 				copy_len = hdr.length;
 				if (copy_len > entry_copy.sge.length)
 					copy_len = entry_copy.sge.length;
-				nex_fast_memcpy((void *)(uintptr_t)entry_copy.sge.addr, payload, copy_len);
+				memcpy((void *)(uintptr_t)entry_copy.sge.addr, payload, copy_len);
 			}
 
 			struct ibv_wc recv_wc = {
@@ -1167,7 +1261,8 @@ static void *nex_rx_worker(void *arg)
 				.qp_num = qp->vqp.qp.qp_num,
 			};
 			nex_cq_push(qp->recv_cq, &recv_wc);
-			free(payload);
+			if (payload_from_pending)
+				free(payload);
 			break;
 		}
 		case NEX_MSG_RDMA_WRITE:
@@ -1200,7 +1295,7 @@ static void *nex_rx_worker(void *arg)
 						if (dest < base || dest + hdr.length > end) {
 							status = -EINVAL;
 						} else if (payload && hdr.length) {
-							nex_fast_memcpy((void *)dest, payload, hdr.length);
+							memcpy((void *)dest, payload, hdr.length);
 							copy_len = hdr.length;
 						}
 					}
@@ -1236,7 +1331,7 @@ static void *nex_rx_worker(void *arg)
 						copy_len = hdr.length;
 						if (copy_len > entry_copy.sge.length)
 							copy_len = entry_copy.sge.length;
-						nex_fast_memcpy((void *)(uintptr_t)entry_copy.sge.addr, payload, copy_len);
+						memcpy((void *)(uintptr_t)entry_copy.sge.addr, payload, copy_len);
 					}
 				} else {
 					copy_len = 0;
@@ -1262,10 +1357,12 @@ static void *nex_rx_worker(void *arg)
 					.imm_data = hdr.imm_data,
 				};
 				nex_cq_push(qp->recv_cq, &recv_wc);
-				free(payload);
+				if (payload_from_pending)
+					free(payload);
 			} else {
 				// Plain RDMA_WRITE: nothing to signal on RX.
-				free(payload);
+				if (payload_from_pending)
+					free(payload);
 			}
 			break;
 		}
@@ -1292,20 +1389,14 @@ static void *nex_rx_worker(void *arg)
 					resp.status = NEX_MSG_STATUS_REMOTE_ERROR;
 					resp.length = 0;
 				} else if (hdr.length) {
-					resp_buf = malloc(hdr.length);
-					if (!resp_buf) {
-						resp.status = NEX_MSG_STATUS_REMOTE_ERROR;
-						resp.length = 0;
-					} else {
-						nex_fast_memcpy(resp_buf, (void *)src, hdr.length);
-					}
+					resp_buf = src;
 				}
 			}
 			if (nex_send_msg(qp, &resp, resp_buf, resp.length))
 				   NEX_TRACE("failed to send rdma_read_resp qp_pair=%u:%u",
 					   qp->vqp.qp.qp_num, qp->remote_qp_num);
-			free(resp_buf);
-			free(payload);
+			if (payload_from_pending)
+				free(payload);
 			break;
 		}
 		case NEX_MSG_RDMA_READ_RESP: {
@@ -1329,7 +1420,7 @@ static void *nex_rx_worker(void *arg)
 					size_t chunk = entry->sge[i].length;
 					if (chunk > remaining)
 						chunk = remaining;
-					nex_fast_memcpy((void *)(uintptr_t)entry->sge[i].addr, src, chunk);
+					memcpy((void *)(uintptr_t)entry->sge[i].addr, src, chunk);
 					src += chunk;
 					remaining -= chunk;
 					read_wc.byte_len += (uint32_t)chunk;
@@ -1339,13 +1430,15 @@ static void *nex_rx_worker(void *arg)
 			}
 			nex_cq_push(qp->send_cq, &read_wc);
 			free(entry);
-			free(payload);
+			if (payload_from_pending)
+				free(payload);
 			break;
 		}
 		default:
 			   NEX_TRACE("unknown opcode %u qp_pair=%u:%u", hdr.opcode,
 				   qp->vqp.qp.qp_num, qp->remote_qp_num);
-			free(payload);
+			if (payload_from_pending)
+				free(payload);
 			should_exit = true;
 			break;
 		}
@@ -1353,10 +1446,10 @@ static void *nex_rx_worker(void *arg)
 			break;
 	}
 
-	pthread_mutex_lock(&qp->lock);
+	free(payload_buf);
+	pthread_spin_lock(&qp->lock);
 	qp->rx_running = false;
-	pthread_cond_broadcast(&qp->recv_cond);
-	pthread_mutex_unlock(&qp->lock);
+	pthread_spin_unlock(&qp->lock);
 	return NULL;
 }
 
@@ -1433,7 +1526,6 @@ fail:
 // central server assigns role (listen/connect) to each side, and match the pairs
 static int nex_qp_establish_sync(struct nex_qp *qp)
 {
-
 
 #ifdef USE_TCP
 	int listen_fd = -1;
@@ -1635,7 +1727,7 @@ static void nex_free_context(struct ibv_context *ibctx)
 		close(ctx->qp_counter_fd);
 		ctx->qp_counter_fd = -1;
 	}
-	pthread_mutex_lock(&ctx->mr_lock);
+	pthread_spin_lock(&ctx->mr_lock);
 	struct nex_mr *mr = ctx->mr_list;
 	while (mr) {
 		struct nex_mr *next = mr->next;
@@ -1643,8 +1735,8 @@ static void nex_free_context(struct ibv_context *ibctx)
 		mr = next;
 	}
 	ctx->mr_list = NULL;
-	pthread_mutex_unlock(&ctx->mr_lock);
-	pthread_mutex_destroy(&ctx->mr_lock);
+	pthread_spin_unlock(&ctx->mr_lock);
+	pthread_spin_destroy(&ctx->mr_lock);
 	verbs_uninit_context(&ctx->ibv_ctx);
 	free(ctx);
 }
@@ -1694,6 +1786,12 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
 					       int cmd_fd, void *private_data)
 {
 	struct nex_context *ctx;
+	
+	if (get_accvm_symbols(&accvm_syms) != 0) {
+    	fprintf(stderr, "Error: required ACCVM symbols not available\n");
+    	return -1;
+  	}
+
 	// MACRO
 	ctx = verbs_init_and_alloc_context(ibdev, cmd_fd, ctx, ibv_ctx,
 					       RDMA_DRIVER_UNKNOWN);
@@ -1714,7 +1812,7 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
     ctx->qp_counter_fd = -1;
     ctx->qp_counter = NULL;
     ctx->qp_limit = NEX_DEFAULT_MAX_QP;
-    pthread_mutex_init(&ctx->mr_lock, NULL);
+    pthread_spin_init(&ctx->mr_lock, PTHREAD_PROCESS_PRIVATE);
     ctx->mr_list = NULL;
     const char *env_limit = getenv("NEX_MAX_QP");
     if (env_limit && *env_limit) {

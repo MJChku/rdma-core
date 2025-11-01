@@ -1196,10 +1196,15 @@ int main(int argc, char *argv[])
 
 	ibv_ack_cq_events(pp_cq(ctx), num_cq_events);
 
+	printf("Close 1\n");
+
 	if (pp_close_ctx(ctx))
 		return 1;
 
+	printf("Close 2\n");
 	ibv_free_device_list(dev_list);
+
+	printf("Close 3\n");
 	free(rem_dest);
 
 	return 0;
