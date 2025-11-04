@@ -297,15 +297,13 @@ static void nex_cq_push(struct nex_cq *cq, const struct ibv_wc *wc)
 static int nex_cq_pop(struct nex_cq *cq, int num_entries, struct ibv_wc *wc)
 {
 	int produced = 0;
-	accvm_syms.compressT(2000.0f);
-	accvm_syms.changeEpoch(250, 4);
+	// fast path, don't compressT
 	pthread_spin_lock(&cq->lock);
 	while (produced < num_entries && cq->head != cq->tail) {
 		wc[produced++] = cq->entries[cq->head];
 		cq->head = (cq->head + 1) % cq->capacity;
 	}
 	pthread_spin_unlock(&cq->lock);
-	accvm_syms.compressT(1.0f);
 	NEX_TRACE_TIMING("nex_cq_pop produced=%d/%d", produced, num_entries);
 	return produced;
 }
@@ -1366,9 +1364,9 @@ static void *nex_rx_worker(void *arg)
 				break;
 			accvm_syms.changeEpoch(250, 16);
 
-            bool expect_payload = (hdr.opcode == NEX_MSG_SEND ||
-                                    hdr.opcode == NEX_MSG_RDMA_WRITE ||
-                                    hdr.opcode == NEX_MSG_RDMA_WRITE_IMM);
+            // Do not prefetch payload here; op handlers will stream into
+            // destination via nex_shm_readv to avoid extra copies.
+            bool expect_payload = false;
 			
 			   NEX_TRACE("rx header wr_id=%" PRIu64 " opcode=%u len=%u status=%u hdr.length=%u qp_pair=%u:%u",
 				   hdr.wr_id, hdr.opcode, hdr.length, hdr.status, hdr.length,
@@ -1398,43 +1396,48 @@ static void *nex_rx_worker(void *arg)
 		switch (hdr.opcode) {
 		case NEX_MSG_SEND: {
 			struct nex_recv_entry entry_copy;
-			size_t copy_len = 0;
-			bool have_recv = false;
-
 			if (!nex_try_take_recv(qp, &entry_copy)) {
-				/* No RECV posted yet: queue for later and continue */
 				fprintf(stderr, "ERROR: send without posted recv, wr_id=%" PRIu64 " qp_pair=%u:%u", hdr.wr_id,
 					   qp->vqp.qp.qp_num, qp->remote_qp_num);
 				fflush(stderr);
 				exit(1);
-				// nex_push_pending_msg(qp, &hdr, payload, payload_len);
-				payload = NULL; 
-				break;
 			}
-			
+
 			NEX_TRACE("recv match wr_id=%" PRIu64 " opcode=%u len=%u qp_pair=%u:%u",
 				   entry_copy.wr_id, hdr.opcode, hdr.length,
 				   qp->vqp.qp.qp_num, qp->remote_qp_num);
 
-			if (hdr.length && payload) {
-				copy_len = hdr.length;
-				if (copy_len > entry_copy.sge.length)
-					copy_len = entry_copy.sge.length;
-				// DOTO, optimize, no memcpy.
-				memcpy((void *)(uintptr_t)entry_copy.sge.addr, payload, copy_len);
+			size_t want = hdr.length;
+			size_t dst_cap = entry_copy.sge.length;
+			size_t to_read = want < dst_cap ? want : dst_cap;
+			size_t read_bytes = 0;
+			enum ibv_wc_status wc_status = IBV_WC_SUCCESS;
+
+			if (to_read) {
+				struct iovec iov = {
+					.iov_base = (void *)(uintptr_t)entry_copy.sge.addr,
+					.iov_len  = to_read,
+				};
+				int slot = -1;
+				ssize_t n = nex_shm_readv(qp->rx_fd, &iov, 1, 1, true, &slot);
+				if (n < 0 || (size_t)n != to_read) {
+					wc_status = IBV_WC_LOC_LEN_ERR;
+				} else {
+					read_bytes = (size_t)n;
+				}
 			}
 
+			if (read_bytes != want)
+				wc_status = IBV_WC_LOC_LEN_ERR;
+
 			struct ibv_wc recv_wc = {
-				.wr_id = entry_copy.wr_id,
-				.status = copy_len == hdr.length ?
-					IBV_WC_SUCCESS : IBV_WC_LOC_LEN_ERR,
-				.opcode = IBV_WC_RECV,
-				.byte_len = (uint32_t)copy_len,
-				.qp_num = qp->vqp.qp.qp_num,
+				.wr_id    = entry_copy.wr_id,
+				.status   = wc_status,
+				.opcode   = IBV_WC_RECV,
+				.byte_len = (uint32_t)read_bytes,
+				.qp_num   = qp->vqp.qp.qp_num,
 			};
 			nex_cq_push(qp->recv_cq, &recv_wc);
-			if (payload_from_pending)
-				free(payload);
 			break;
 		}
 		case NEX_MSG_RDMA_WRITE:
@@ -1464,12 +1467,22 @@ static void *nex_rx_worker(void *arg)
 									hdr.rkey, hdr.opcode, dest, mr->vmr.ibv_mr.addr, mr->vmr.ibv_mr.length, hdr.length,
 									qp->vqp.qp.qp_num, qp->remote_qp_num);
 
-						if (dest < base || dest + hdr.length > end) {
-							status = -EINVAL;
-						} else if (payload && hdr.length) {
-							memcpy((void *)dest, payload, hdr.length);
-							copy_len = hdr.length;
-						}
+                        if (dest < base || dest + hdr.length > end) {
+                            status = -EINVAL;
+                        } else if (hdr.length) {
+                            // Stream payload directly from ring into target memory
+                            struct iovec iov = {
+                                .iov_base = (void *)dest,
+                                .iov_len  = hdr.length,
+                            };
+                            int slot = -1;
+                            ssize_t n = nex_shm_readv(qp->rx_fd, &iov, 1, 1, true, &slot);
+                            if (n < 0 || (size_t)n != hdr.length) {
+                                status = -EIO;
+                            } else {
+                                copy_len = (size_t)n;
+                            }
+                        }
 					}
 				}
 				if (status)
@@ -1498,16 +1511,23 @@ static void *nex_rx_worker(void *arg)
 							entry_copy.wr_id, hdr.opcode, zero_len_imm ? 0 : hdr.length,
 							qp->vqp.qp.qp_num, qp->remote_qp_num);
 
-				if (!zero_len_imm) {
-					if (hdr.length && payload && entry_copy.sge.length) {
-						copy_len = hdr.length;
-						if (copy_len > entry_copy.sge.length)
-							copy_len = entry_copy.sge.length;
-						memcpy((void *)(uintptr_t)entry_copy.sge.addr, payload, copy_len);
-					}
-				} else {
-					copy_len = 0;
-				}
+                if (!zero_len_imm) {
+                    if (hdr.length && entry_copy.sge.length) {
+                        size_t to_copy = hdr.length;
+                        if (to_copy > entry_copy.sge.length)
+                            to_copy = entry_copy.sge.length;
+                        struct iovec iov = {
+                            .iov_base = (void *)(uintptr_t)entry_copy.sge.addr,
+                            .iov_len  = to_copy,
+                        };
+                        int slot = -1;
+                        ssize_t n = nex_shm_readv(qp->rx_fd, &iov, 1, 1, true, &slot);
+                        if (n > 0)
+                            copy_len = (size_t)n;
+                    }
+                } else {
+                    copy_len = 0;
+                }
 
 				enum ibv_wc_status wc_status;
 				if (status != 0) {
@@ -1529,13 +1549,11 @@ static void *nex_rx_worker(void *arg)
 					.imm_data = hdr.imm_data,
 				};
 				nex_cq_push(qp->recv_cq, &recv_wc);
-				if (payload_from_pending)
-					free(payload);
-			} else {
-				// Plain RDMA_WRITE: nothing to signal on RX.
-				if (payload_from_pending)
-					free(payload);
-			}
+            // No prefetch used; nothing to free
+        } else {
+            // Plain RDMA_WRITE: nothing to signal on RX.
+            // No prefetch used; nothing to free
+        }
 			break;
 		}
 
@@ -1589,20 +1607,9 @@ static void *nex_rx_worker(void *arg)
         case NEX_MSG_RDMA_READ_RESP: {
             struct nex_pending_read *entry = nex_take_pending_read(qp, hdr.wr_id);
             if (!entry) {
-                // Consume and drop payload to keep ring in sync if any
-                if (hdr.length) {
-                    if (hdr.length > payload_capacity) {
-                        size_t new_capacity = hdr.length;
-                        if (new_capacity < initial_capacity)
-                            new_capacity = initial_capacity;
-                        uint8_t *new_buf = realloc(payload_buf, new_capacity);
-                        if (!new_buf)
-                            break;
-                        payload_buf = new_buf;
-                        payload_capacity = new_capacity;
-                    }
-                    (void)nex_read_full(qp->rx_fd, payload_buf, hdr.length, 1);
-                }
+                NEX_ERROR("rdma_read_resp with no pending read wr_id=%" PRIu64 " qp_pair=%u:%u",
+						   hdr.wr_id, qp->vqp.qp.qp_num, qp->remote_qp_num);
+				free(entry);
                 break;
             }
             struct ibv_wc read_wc = {
