@@ -25,15 +25,15 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-// #define DEBUG
+#define NEX_ERROR(fmt, ...) fprintf(stderr, "ERROR: nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
+
 #ifdef DEBUG
 #define NEX_TRACE_TIMING(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
-#define NEX_TRACE(fmt, ...) fprintf(stderr, "nex_shm (%d): " fmt "\n", get_nex_id(), ##__VA_ARGS__)
+#define NEX_TRACE(fmt, ...) fprintf(stderr, "nex (%d, %lu ms): " fmt "\n", get_nex_id(), now_ns() / 1000000, ##__VA_ARGS__)
 #else
 #define NEX_TRACE_TIMING(fmt, ...) do { } while (0)
 #define NEX_TRACE(fmt, ...) do { } while (0)
 #endif
-
 struct accvm_symbols accvm_syms = {0};
 
 static uint32_t parse_u32(const char* s)
@@ -47,10 +47,10 @@ static uint32_t parse_u32(const char* s)
     return (uint32_t)v;
 }
 
-static void* get_accvm_lib(){
+static void* get_accvm_lib(void){
     void* handle = dlopen("accvm.so", RTLD_LAZY | RTLD_LOCAL);
     if (!handle) {
-        fprintf(stderr, "Error loading libaccvm.so: %s\n", dlerror());
+        NEX_ERROR("loading libaccvm.so: %s\n", dlerror());
         return NULL;
     }
     return handle;
@@ -62,37 +62,37 @@ int get_accvm_symbols(struct accvm_symbols* syms) {
 
     syms->compressT = (compressT_t)dlsym(handle, "compressT");
     if (!syms->compressT) {
-        fprintf(stderr, "Error getting compressT: %s\n", dlerror());
+        NEX_ERROR("getting compressT: %s\n", dlerror());
     }
 
     syms->jailbreakT = (jailbreakT_t)dlsym(handle, "jailbreakT");
     if (!syms->jailbreakT) {
-        fprintf(stderr, "Error getting jailbreakT: %s\n", dlerror());
+        NEX_ERROR("getting jailbreakT: %s\n", dlerror());
     }
 
     syms->endJailbreakT = (end_jailbreakT_t)dlsym(handle, "endJailbreakT");
     if (!syms->endJailbreakT) {
-        fprintf(stderr, "Error getting endJailbreakT: %s\n", dlerror());
-    } 
-
-    syms->send_data = (send_data_t)dlsym(handle, "send_data");
-    if (!syms->send_data) {
-        fprintf(stderr, "Error getting send_data: %s\n", dlerror());
+        NEX_ERROR("getting endJailbreakT: %s\n", dlerror());
     }
 
-    syms->recv_data = (recv_data_t)dlsym(handle, "recv_data");
-    if (!syms->recv_data) {
-        fprintf(stderr, "Error getting recv_data: %s\n", dlerror());
+    syms->changeEpoch = (changeEpoch_t)dlsym(handle, "changeEpoch");
+    if (!syms->changeEpoch) {
+        NEX_ERROR("getting changeEpoch: %s\n", dlerror());
     }
 
     syms->send_data_qp = (send_data_qp_t)dlsym(handle, "send_data_qp");
     if (!syms->send_data_qp) {
-        fprintf(stderr, "Error getting send_data_qp: %s\n", dlerror());
+        NEX_ERROR("getting send_data_qp: %s\n", dlerror());
     }
 
     syms->recv_data_qp = (recv_data_qp_t)dlsym(handle, "recv_data_qp");
     if (!syms->recv_data_qp) {
-        fprintf(stderr, "Error getting recv_data_qp: %s\n", dlerror());
+        NEX_ERROR("getting recv_data_qp: %s\n", dlerror());
+    }
+
+    syms->wait_for_completion = (wait_for_completion_t)dlsym(handle, "wait_for_completion");
+    if (!syms->wait_for_completion) {
+        NEX_ERROR("getting wait_for_completion: %s\n", dlerror());
     }
 
     if (!syms->send_data_qp || !syms->recv_data_qp)
@@ -100,7 +100,7 @@ int get_accvm_symbols(struct accvm_symbols* syms) {
     return 0;
 }
 
-void yield(){
+void yield(void){
   sched_yield();
   // nanosleep((const struct timespec[]){{0, 1000000}}, NULL);
 }
@@ -248,8 +248,6 @@ static int open_local_ring(const char* name, uint64_t bytes, struct shm_ring* ou
 
   uint64_t sz = pow2_u64(bytes);
   size_t map_len = sizeof(struct shm_ring_hdr) + (size_t)sz;
-
-  struct stat st;
 
   if (ftruncate(fd, (off_t)map_len) != 0) { int e = -errno; close(fd); return e; }
 
@@ -403,16 +401,21 @@ int nex_shm_dial(const char* service_id, int* fd_out) {
 
 
 ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
-  
-  apply_perf_model = 0;
+  // apply_perf_model = 0; // --- IGNORE ---
+  int slot = 0;
+ 
+
   struct nex_shm_conn* c = conn_get(fd);
   if (!c) { errno = EBADF; return -1; }
   if (len == 0) return 0;
 
+  if(apply_perf_model){
+    slot = accvm_syms.recv_data_qp(c->remote_lid, c->local_lid, len, c->remote_qp, c->local_qp, true);
+  }
+
   struct shm_ring_hdr* h = c->rx.h;
   size_t done = 0;
   int iter = 0;
-
   while (done < len) {
 
     // pthread_mutex_lock(&h->lock);
@@ -433,7 +436,8 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
       continue;
     }
 
-    NEX_TRACE_TIMING("nex_shm_read data (iter=%d) need=%lu done=%lu head=%lu tail=%lu", iter++, (unsigned long)(len - done), (unsigned long)done, (unsigned long)head, (unsigned long)tail);
+    iter++;
+    NEX_TRACE_TIMING("nex_shm_read data (iter=%d) need=%lu done=%lu head=%lu tail=%lu", iter, (unsigned long)(len - done), (unsigned long)done, (unsigned long)head, (unsigned long)tail);
 
     size_t need = len - done;
     size_t to_read = (size_t)avail < need ? (size_t)avail : need;
@@ -453,7 +457,7 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
   }
 
   if (apply_perf_model) {
-    accvm_syms.recv_data_qp(c->remote_lid, c->local_lid, len, c->remote_qp, c->local_qp);
+    accvm_syms.wait_for_completion(slot);
   }
 
   return (ssize_t)done; // == len
@@ -462,17 +466,17 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
 /* Block until exactly len bytes are written, or error. Returns len on success, -1 on error (errno set). */
 ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model) {
   
-  apply_perf_model = 0;
-
   struct nex_shm_conn* c = conn_get(fd);
   if (!c) { errno = EBADF; return -1; }
   if (len == 0) return 0;
 
   struct shm_ring_hdr* h = c->tx.h;
-
+  int slot = 0;
+  if(apply_perf_model){
+    slot = accvm_syms.send_data_qp(c->local_lid, c->remote_lid, len, c->local_qp, c->remote_qp, true);
+  }
   size_t done = 0;
   int iter = 0;
-
   while (done < len) {
     // pthread_mutex_lock(&h->lock);
 
@@ -488,7 +492,8 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model)
         // pthread_mutex_unlock(&h->lock);
         return -1;
       }
-      NEX_TRACE("nex_shm_write waiting for free space (iter=%d)", iter++);
+      iter++;
+      NEX_TRACE("nex_shm_write waiting for free space (iter=%d)", iter);
       // pthread_mutex_unlock(&h->lock);
       yield();
       continue;
@@ -514,11 +519,143 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model)
     done += to_write;
   }
 
-  if (apply_perf_model) {
-    accvm_syms.send_data_qp(c->local_lid, c->remote_lid, len, c->local_qp, c->remote_qp);
+  if(apply_perf_model){
+    accvm_syms.wait_for_completion(slot);
+  }
+  
+  return (ssize_t)done; // == len
+}
+
+static int nex_shm_copy_from_iov(const struct iovec *iov, int iovcnt,
+                                 size_t *index, size_t *offset,
+                                 uint8_t *dst, size_t len)
+{
+  size_t remaining = len;
+  while (remaining > 0) {
+    if (*index >= (size_t)iovcnt)
+      return -1;
+    const struct iovec *cur = &iov[*index];
+    if (cur->iov_len == 0) {
+      ++(*index);
+      *offset = 0;
+      continue;
+    }
+    if (*offset >= cur->iov_len) {
+      ++(*index);
+      *offset = 0;
+      continue;
+    }
+    size_t avail = cur->iov_len - *offset;
+    size_t chunk = avail < remaining ? avail : remaining;
+    memcpy(dst, (const uint8_t *)cur->iov_base + *offset, chunk);
+    dst += chunk;
+    remaining -= chunk;
+    *offset += chunk;
+    if (*offset == cur->iov_len) {
+      ++(*index);
+      *offset = 0;
+    }
+  }
+  return 0;
+}
+
+ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
+                       int apply_perf_model, bool wait_completion, int *slot_out) {
+
+  // apply_perf_model = 0; // --- IGNORE ---
+  if (iovcnt < 0) {
+    errno = EINVAL;
+    return -1;
   }
 
-  return (ssize_t)done; // == len
+  if (iovcnt > 0 && !iov) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  size_t total_len = 0;
+  for (int i = 0; i < iovcnt; ++i) {
+    if (SIZE_MAX - total_len < iov[i].iov_len) {
+      errno = EOVERFLOW;
+      return -1;
+    }
+    total_len += iov[i].iov_len;
+  }
+
+  if (total_len == 0)
+    return 0;
+  int slot = -1;
+
+  struct nex_shm_conn* c = conn_get(fd);
+  if (!c) { errno = EBADF; return -1; }
+  if (slot_out)
+      *slot_out = -1;
+
+  if(apply_perf_model){
+    slot = accvm_syms.send_data_qp(c->local_lid, c->remote_lid, total_len, c->local_qp, c->remote_qp, wait_completion);
+    if (slot_out)
+        *slot_out = slot;
+  }
+
+  struct shm_ring_hdr* h = c->tx.h;
+
+  size_t done = 0;
+  int iter = 0;
+  size_t iov_index = 0;
+  size_t iov_offset = 0;
+
+  while (done < total_len) {
+    volatile uint64_t size = __atomic_load_n(&h->size, __ATOMIC_ACQUIRE);
+    volatile uint64_t head = __atomic_load_n(&h->head, __ATOMIC_ACQUIRE);
+    volatile uint64_t tail = __atomic_load_n(&h->tail, __ATOMIC_ACQUIRE);
+    volatile uint64_t used = head - tail;
+    volatile uint64_t free_bytes = size - used;
+
+    if (free_bytes == 0) {
+      if (__atomic_load_n(&h->closed, __ATOMIC_ACQUIRE)) {
+        errno = EPIPE;
+        return -1;
+      }
+      NEX_TRACE("nex_shm_writev waiting for free space (iter=%d)", iter++);
+      yield();
+      continue;
+    }
+
+    iter++;
+    NEX_TRACE_TIMING("nex_shm_writev data (iter=%d) need=%lu done=%lu head=%lu tail=%lu",
+                     iter, (unsigned long)(total_len - done), (unsigned long)done,
+                     (unsigned long)head, (unsigned long)tail);
+
+    size_t need = total_len - done;
+    size_t to_write = (size_t)free_bytes < need ? (size_t)free_bytes : need;
+
+    uint64_t h0 = head & (size - 1);
+    uint64_t first = size - h0;
+    if (first >= to_write) first = (uint64_t)to_write;
+
+    if (first) {
+      if (nex_shm_copy_from_iov(iov, iovcnt, &iov_index, &iov_offset,
+                                c->tx.buf + h0, (size_t)first)) {
+        errno = EFAULT;
+        return -1;
+      }
+    }
+    if (first < to_write) {
+      size_t remaining = to_write - (size_t)first;
+      if (nex_shm_copy_from_iov(iov, iovcnt, &iov_index, &iov_offset,
+                                c->tx.buf, remaining)) {
+        errno = EFAULT;
+        return -1;
+      }
+    }
+
+    __atomic_store_n(&h->head, head + (uint64_t)to_write, __ATOMIC_RELEASE);
+    done += to_write;
+  }
+
+  // do not wait here; the caller can await completion asynchronously
+
+  return (ssize_t)done;
 }
 
 // optional cleanup if you need it

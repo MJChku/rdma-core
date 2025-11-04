@@ -18,7 +18,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
+#include <sched.h>
 #include <infiniband/driver.h>
 #include <infiniband/verbs.h>
 
@@ -38,6 +40,7 @@ static uint64_t now_ns(void)
 }
 
 // #define DEBUG
+#define NEX_ERROR(fmt, ...) fprintf(stderr, "ERROR: nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 
 #ifdef DEBUG
 #define NEX_TRACE_TIMING(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
@@ -153,6 +156,75 @@ static int nex_write_full(int fd, const void *buf, size_t len, int apply_perf)
 	return 0;
 }
 
+static int nex_write_fullv(int fd, const struct iovec *iov, int iovcnt,
+		   size_t total_len, int apply_perf, bool wait_completion, int *slot_out)
+{
+	if (!iov || iovcnt <= 0 || total_len == 0) {
+		if (slot_out)
+			*slot_out = -1;
+		return 0;
+	}
+
+#ifdef USE_TCP
+	(void)apply_perf;
+	const int stack_cap = NEX_MAX_SGE;
+	struct iovec stack_iov[stack_cap];
+	struct iovec *local = stack_iov;
+
+	if (iovcnt > stack_cap) {
+		local = malloc((size_t)iovcnt * sizeof(*local));
+		if (!local)
+			return -1;
+	}
+
+	memcpy(local, iov, (size_t)iovcnt * sizeof(*local));
+
+	size_t remaining = total_len;
+	int idx = 0;
+	while (remaining > 0) {
+		ssize_t n = writev(fd, &local[idx], iovcnt - idx);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			if (local != stack_iov)
+				free(local);
+			return -1;
+		}
+		if (n == 0) {
+			if (local != stack_iov)
+				free(local);
+			return -1;
+		}
+
+		remaining -= (size_t)n;
+
+		ssize_t consumed = n;
+		while (idx < iovcnt && consumed > 0) {
+			if (consumed >= (ssize_t)local[idx].iov_len) {
+				consumed -= (ssize_t)local[idx].iov_len;
+				++idx;
+			} else {
+				local[idx].iov_base =
+					(uint8_t *)local[idx].iov_base + consumed;
+				local[idx].iov_len -= (size_t)consumed;
+				consumed = 0;
+			}
+		}
+	}
+
+	if (local != stack_iov)
+		free(local);
+	if (slot_out)
+		*slot_out = -1;
+#else
+	ssize_t n = nex_shm_writev(fd, iov, iovcnt, apply_perf, wait_completion, slot_out);
+	if (n < 0 || (size_t)n != total_len)
+		return -1;
+#endif
+
+	return 0;
+}
+
 static int nex_read_full(int fd, void *buf, size_t len, int apply_perf)
 {
 #ifdef USE_TCP
@@ -225,7 +297,8 @@ static void nex_cq_push(struct nex_cq *cq, const struct ibv_wc *wc)
 static int nex_cq_pop(struct nex_cq *cq, int num_entries, struct ibv_wc *wc)
 {
 	int produced = 0;
-	accvm_syms.compressT(1000.0f);
+	accvm_syms.compressT(2000.0f);
+	accvm_syms.changeEpoch(250, 4);
 	pthread_spin_lock(&cq->lock);
 	while (produced < num_entries && cq->head != cq->tail) {
 		wc[produced++] = cq->entries[cq->head];
@@ -239,7 +312,11 @@ static int nex_cq_pop(struct nex_cq *cq, int num_entries, struct ibv_wc *wc)
 
 static void *nex_rx_worker(void *arg);
 static int nex_send_msg(struct nex_qp *qp, const struct nex_msg_hdr *hdr,
-			    const void *payload, size_t payload_len);
+                        const struct iovec *payload_iov,
+                        int payload_iovcnt, size_t payload_len,
+						bool wait_completion,
+                        int* out_slot);
+
 static struct nex_mr *nex_find_mr(struct nex_context *ctx, uint32_t rkey);
 static int nex_add_pending_read(struct nex_qp *qp, uint64_t wr_id,
 			      const struct ibv_sge *sg_list, int num_sge,
@@ -324,7 +401,7 @@ static struct nex_mr *nex_find_mr(struct nex_context *ctx, uint32_t rkey)
 	pthread_spin_unlock(&ctx->mr_lock);
 
 	if(count_match > 1){
-		fprintf(stderr, "!! ERROR: rkey=%u matched %d MRs, returning first match", rkey, count_match);
+		NEX_ERROR("rkey=%u matched %d MRs, returning first match", rkey, count_match);
 	}
 	return mr;
 }
@@ -367,18 +444,86 @@ static struct nex_pending_read *nex_take_pending_read(struct nex_qp *qp,
 }
 
 static int nex_send_msg(struct nex_qp *qp, const struct nex_msg_hdr *hdr,
-			    const void *payload, size_t payload_len)
+                        const struct iovec *payload_iov,
+                        int payload_iovcnt, size_t payload_len,
+                        bool wait_completion,
+                        int* out_slot)
 {
-	int rc = 0;
-	pthread_spin_lock(&qp->send_lock);
-	if (nex_write_full(qp->tx_fd, hdr, sizeof(*hdr), 0))  // header: no perf model
-		rc = errno ? errno : EIO;
-	if (!rc && payload_len) {
-		if (nex_write_full(qp->tx_fd, payload, payload_len, 1))  // payload: apply perf model
-			rc = errno ? errno : EIO;
-	}
-	pthread_spin_unlock(&qp->send_lock);
-	return rc;
+    int rc = 0;
+    pthread_spin_lock(&qp->send_lock);
+    if (nex_write_full(qp->tx_fd, hdr, sizeof(*hdr), 0))  // header: no perf model
+        rc = errno ? errno : EIO;
+    if (!rc && payload_len && payload_iovcnt > 0 && payload_iov) {
+        if (nex_write_fullv(qp->tx_fd, payload_iov, payload_iovcnt,
+                            payload_len, 1, wait_completion, out_slot))  // payload: apply perf model (non-blocking)
+            rc = errno ? errno : EIO;
+    }
+    pthread_spin_unlock(&qp->send_lock);
+    return rc;
+}
+
+static void nex_txq_push(struct nex_qp* qp, uint64_t wr_id, enum ibv_wc_opcode op, uint32_t len, int slot, bool signaled)
+{
+    for (;;) {
+        pthread_spin_lock(&qp->tx_lock);
+        uint32_t next = (qp->tx_tail + 1) % qp->tx_qsize;
+        if (next != qp->tx_head) {
+            qp->tx_queue[qp->tx_tail].wr_id = wr_id;
+            qp->tx_queue[qp->tx_tail].wc_op = op;
+            qp->tx_queue[qp->tx_tail].byte_len = len;
+            qp->tx_queue[qp->tx_tail].slot = slot;
+			qp->tx_queue[qp->tx_tail].signaled = signaled;
+            qp->tx_tail = next;
+            pthread_spin_unlock(&qp->tx_lock);
+			NEX_TRACE_TIMING("nex_txq_push pushed wr_id=%" PRIu64 " opcode=%u len=%u",
+				(uint64_t)wr_id, op, len);
+            return;
+        }
+        pthread_spin_unlock(&qp->tx_lock);
+		NEX_TRACE_TIMING("nex_txq_push waiting for free space");
+    }
+}
+
+static bool nex_txq_pop(struct nex_qp* qp, struct nex_tx_entry* out)
+{
+    for (;;) {
+        pthread_spin_lock(&qp->tx_lock);
+        if (qp->tx_head != qp->tx_tail) {
+            *out = qp->tx_queue[qp->tx_head];
+            qp->tx_head = (qp->tx_head + 1) % qp->tx_qsize;
+            pthread_spin_unlock(&qp->tx_lock);
+            return true;
+        }
+        bool running = qp->tx_running;
+        pthread_spin_unlock(&qp->tx_lock);
+        if (!running)
+            return false;
+        sched_yield();
+    }
+}
+
+static void* nex_tx_worker(void* arg)
+{
+	accvm_syms.compressT(2000.0f);
+    struct nex_qp* qp = arg;
+    struct nex_tx_entry entry;
+    while (nex_txq_pop(qp, &entry)) {
+        if (entry.slot >= 0)
+            accvm_syms.wait_for_completion((uint32_t)entry.slot);
+        struct ibv_wc wc = {
+            .wr_id = entry.wr_id,
+            .status = IBV_WC_SUCCESS,
+            .opcode = entry.wc_op,
+            .byte_len = entry.byte_len,
+            .qp_num = qp->vqp.qp.qp_num,
+        };
+		if(entry.signaled){
+	        nex_cq_push(qp->send_cq, &wc);
+		}
+		NEX_TRACE_TIMING("nex_tx_worker completed wr_id=%" PRIu64 " opcode=%u len=%u",
+			(uint64_t)wc.wr_id, wc.opcode, wc.byte_len);
+    }
+    return NULL;
 }
 
 /* Device and port queries ---------------------------------------------- */
@@ -635,8 +780,6 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 	qp->recv_head = qp->recv_tail = 0;
 	pthread_spin_init(&qp->lock, PTHREAD_PROCESS_PRIVATE);
 	pthread_spin_init(&qp->send_lock, PTHREAD_PROCESS_PRIVATE);
-	qp->send_buf = NULL;
-	qp->send_buf_capacity = 0;
 	pthread_spin_init(&qp->rdma_lock, PTHREAD_PROCESS_PRIVATE);
 	qp->pending_reads = NULL;
 	pthread_mutex_init(&qp->state_lock, NULL);
@@ -651,6 +794,29 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 
 	qp->pending_head = qp->pending_tail = NULL;
 	pthread_spin_init(&qp->pending_lock, PTHREAD_PROCESS_PRIVATE);
+
+	// init tx completion machinery
+	uint32_t send_wr = attr->cap.max_send_wr;
+	if (send_wr == 0)
+		send_wr = 64;
+	qp->tx_qsize = send_wr + 1;
+	qp->tx_queue = calloc(qp->tx_qsize, sizeof(*qp->tx_queue));
+	if (!qp->tx_queue) {
+		pthread_spin_destroy(&qp->pending_lock);
+		pthread_mutex_destroy(&qp->state_lock);
+		pthread_cond_destroy(&qp->state_cond);
+		pthread_spin_destroy(&qp->rdma_lock);
+		pthread_spin_destroy(&qp->send_lock);
+		pthread_spin_destroy(&qp->lock);
+		free(qp->recv_queue);
+		free(qp);
+		errno = ENOMEM;
+		return NULL;
+	}
+	qp->tx_head = qp->tx_tail = 0;
+	pthread_spin_init(&qp->tx_lock, PTHREAD_PROCESS_PRIVATE);
+	qp->tx_running = false;
+	qp->tx_thread = 0;
 
 	qp->ctx = ctx;
 	qp->send_cq = send_cq;
@@ -678,11 +844,13 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
         pthread_mutex_destroy(&qp->state_lock);
         pthread_cond_destroy(&qp->state_cond);
         pthread_spin_destroy(&qp->pending_lock);
+        pthread_spin_destroy(&qp->tx_lock);
+        free(qp->tx_queue);
         pthread_mutex_destroy(&qp->vqp.qp.mutex);
         pthread_cond_destroy(&qp->vqp.qp.cond);
         free(qp->recv_queue);
         free(qp);
-		NEX_TRACE("create_qp: nex_qp_reserve failed");
+	NEX_TRACE("create_qp: nex_qp_reserve failed");
         return NULL;
     }
 
@@ -696,7 +864,7 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
     if (qp->rx_running) {
         pthread_spin_lock(&qp->lock);
         qp->rx_running = false;
-		pthread_spin_unlock(&qp->lock);
+        pthread_spin_unlock(&qp->lock);
 		#ifdef USE_TCP
 		if (qp->rx_fd >= 0)
 			shutdown(qp->rx_fd, SHUT_RDWR);
@@ -715,7 +883,7 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 		close(qp->tx_fd);
 	if (qp->rx_fd >= 0)
 		close(qp->rx_fd);
-	#else
+#else
 	if (qp->tx_fd >= 0) {
 		nex_shm_close(qp->tx_fd);
 		qp->tx_fd = -1;
@@ -726,9 +894,18 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 		qp->rx_fd = -1;
 	}
 	#endif
+
+    // stop tx worker
+    pthread_spin_lock(&qp->tx_lock);
+    qp->tx_running = false;
+    pthread_spin_unlock(&qp->tx_lock);
+    if (qp->tx_thread) {
+        pthread_join(qp->tx_thread, NULL);
+        qp->tx_thread = 0;
+    }
+
 	pthread_spin_destroy(&qp->lock);
 	pthread_spin_destroy(&qp->send_lock);
-	free(qp->send_buf);
 	pthread_spin_lock(&qp->rdma_lock);
 	struct nex_pending_read *pending = qp->pending_reads;
 	while (pending) {
@@ -757,7 +934,9 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 	}
 	qp->pending_head = qp->pending_tail = NULL;
 	pthread_spin_unlock(&qp->pending_lock);
-	pthread_spin_destroy(&qp->pending_lock);
+    pthread_spin_destroy(&qp->pending_lock);
+    pthread_spin_destroy(&qp->tx_lock);
+    free(qp->tx_queue);
 	free(qp->recv_queue);
     free(qp);
     return 0;
@@ -797,7 +976,6 @@ static int nex_modify_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
 		(attr_mask & IBV_QP_STATE) ? attr->qp_state : -1);
 		
 	struct nex_qp *qp = to_nqp(ibqp);
-	bool retry_connect = false;
 
 	if (attr_mask & IBV_QP_DEST_QPN) {
 		qp->remote_qp_num = attr->dest_qp_num;
@@ -932,20 +1110,21 @@ static int nex_qp_wait_connected(struct nex_qp *qp)
 static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 			 struct ibv_recv_wr **bad_wr)
 {
-
 	struct nex_qp *qp = to_nqp(ibqp);
+
+	accvm_syms.compressT(2000.0f);
+	accvm_syms.changeEpoch(250, 16);
 
 	// iterate through work requests (wr)
 	// wr has next and sg_list (scatter-gather list)
 	// each sg_list has addr, length, lkey
-	accvm_syms.compressT(1000.0f);
 	NEX_TRACE_TIMING("nex_post_recv produced");
 
 	for (; wr; wr = wr->next) {
 		if (wr->num_sge > 1) {
 			if (bad_wr)
 				*bad_wr = wr;
-			NEX_TRACE("ERROR: post_recv num_sge=%d unsupported\n", wr->num_sge);
+			NEX_ERROR("post_recv num_sge=%d unsupported", wr->num_sge);
 			errno = ENOTSUP;
 			return ENOTSUP;
 		}
@@ -954,24 +1133,28 @@ static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 		       (uint64_t)wr->wr_id, wr->num_sge,
 		       wr->num_sge ? wr->sg_list[0].length : 0U,
 		       qp->vqp.qp.qp_num);
-		pthread_spin_lock(&qp->lock);
-		uint32_t next_tail = (qp->recv_tail + 1) % qp->recv_size;
-		if (next_tail == qp->recv_head) {
+			   
+    	// Wait for available space instead of failing when queue is full
+		for (;;) {
+			pthread_spin_lock(&qp->lock);
+			uint32_t next_tail = (qp->recv_tail + 1) % qp->recv_size;
+			if (next_tail != qp->recv_head) {
+				// Space available; enqueue and break
+				struct nex_recv_entry *entry = &qp->recv_queue[qp->recv_tail];
+				entry->wr_id = wr->wr_id;
+				if (wr->num_sge == 1)
+					entry->sge = wr->sg_list[0];
+				else
+					memset(&entry->sge, 0, sizeof(entry->sge));
+				qp->recv_tail = next_tail;
+				pthread_spin_unlock(&qp->lock);
+				break;
+			}
+			// Queue full; release lock and yield before retrying
 			pthread_spin_unlock(&qp->lock);
-			if (bad_wr)
-				*bad_wr = wr;
-			NEX_TRACE("ERROR: post_recv queue full");
-			errno = ENOMEM;
-			return ENOMEM;
+			NEX_TRACE("post_recv queue full; waiting for space");
+			sched_yield();
 		}
-		struct nex_recv_entry *entry = &qp->recv_queue[qp->recv_tail];
-		entry->wr_id = wr->wr_id;
-		if (wr->num_sge == 1)
-			entry->sge = wr->sg_list[0];
-		else
-			memset(&entry->sge, 0, sizeof(entry->sge));
-		qp->recv_tail = next_tail;
-		pthread_spin_unlock(&qp->lock);
 	}
 	accvm_syms.compressT(1.0f);
 	return 0;
@@ -980,15 +1163,17 @@ static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			 struct ibv_send_wr **bad_wr)
 {
-	struct nex_qp *qp = to_nqp(ibqp);
 
-	accvm_syms.compressT(1000.0f);
+	accvm_syms.compressT(2000.0f);
+	accvm_syms.changeEpoch(250, 16);
+
+	struct nex_qp *qp = to_nqp(ibqp);
 	NEX_TRACE_TIMING("nex_post_send produced");
 
 	if (qp->vqp.qp.state != IBV_QPS_RTS) {
 		if (bad_wr)
 			*bad_wr = wr;
-		NEX_TRACE("ERROR: post_send qp not in RTS state");
+		NEX_ERROR("ERROR: post_send qp not in RTS state");
 		errno = EINVAL;
 		return EINVAL;
 	}
@@ -998,11 +1183,12 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		if (rc) {
 			if (bad_wr)
 				*bad_wr = wr;
-			NEX_TRACE("ERROR: post_send wait_connected failed");
+			NEX_ERROR("post_send wait_connected failed");
 			errno = rc;
 			return rc;
 		}
 	}
+
 
 	for (; wr; wr = wr->next) {
 
@@ -1019,7 +1205,7 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		if ((!allow_zero_sge && wr->num_sge == 0) || wr->num_sge > NEX_MAX_SGE) {
 			if (bad_wr) *bad_wr = wr;
 			errno = EINVAL;
-			NEX_TRACE("ERROR: post_send num_sge=%d unsupported\n", wr->num_sge);
+			NEX_ERROR("post_send num_sge=%d unsupported\n", wr->num_sge);
 			goto ERROR_OUT;
 		}
 
@@ -1039,8 +1225,11 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		};
 
 		int rc = 0;
-		uint8_t *tmp = NULL;
 		size_t payload_len = total_len;
+		struct iovec payload_iov[NEX_MAX_SGE];
+		int payload_iovcnt = 0;
+
+		bool wait_completion = true;
 
 		switch (wr->opcode) {
 		case IBV_WR_SEND:
@@ -1063,13 +1252,14 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			hdr.rkey = wr->wr.rdma.rkey;
 			hdr.length = (uint32_t)total_len;
 			payload_len = 0;
+			wait_completion = false;
 			rc = nex_add_pending_read(qp, wr->wr_id, wr->sg_list,
 					      wr->num_sge, total_len);
 			if (rc) {
 				if (bad_wr)
 					*bad_wr = wr;
 				errno = rc;
-				NEX_TRACE("ERROR: post_send add_pending_read failed");
+				NEX_ERROR("post_send add_pending_read failed");
 				goto ERROR_OUT;
 			}
 			break;
@@ -1077,76 +1267,60 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			if (bad_wr)
 				*bad_wr = wr;
 			errno = ENOTSUP;
-			NEX_TRACE("ERROR: post_send opcode=%d unsupported\n", wr->opcode);
+			NEX_ERROR("post_send opcode=%d unsupported\n", wr->opcode);
 			goto ERROR_OUT;
 		}
 
-		if (wr->opcode == IBV_WR_SEND ||
-		    wr->opcode == IBV_WR_RDMA_WRITE ||
-		    wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM) {
-			if (total_len) {
-				// Reuse or grow send buffer
-				if (total_len > qp->send_buf_capacity) {
-					size_t new_capacity = total_len;
-					if (new_capacity < 4096)
-						new_capacity = 4096;
-					uint8_t *new_buf = realloc(qp->send_buf, new_capacity);
-					if (!new_buf) {
-						if (bad_wr)
-							*bad_wr = wr;
-						errno = ENOMEM;
-						goto ERROR_OUT;
-					}
-					qp->send_buf = new_buf;
-					qp->send_buf_capacity = new_capacity;
-				}
-				tmp = qp->send_buf;
-				size_t off = 0;
-				for (int i = 0; i < wr->num_sge; ++i) {
-					memcpy(tmp + off, (void *)(uintptr_t)wr->sg_list[i].addr,
-					       wr->sg_list[i].length);
-					off += wr->sg_list[i].length;
-				}
+		if ((wr->opcode == IBV_WR_SEND ||
+		     wr->opcode == IBV_WR_RDMA_WRITE ||
+		     wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM) && total_len) {
+			for (int i = 0; i < wr->num_sge; ++i) {
+				if (wr->sg_list[i].length == 0)
+					continue;
+				payload_iov[payload_iovcnt].iov_base =
+					(void *)(uintptr_t)wr->sg_list[i].addr;
+				payload_iov[payload_iovcnt].iov_len =
+					wr->sg_list[i].length;
+				++payload_iovcnt;
 			}
 		}
 
-		rc = nex_send_msg(qp, &hdr, tmp, payload_len);
-		if (rc) {
-			if (wr->opcode == IBV_WR_RDMA_READ) {
-				struct nex_pending_read *entry =
-					nex_take_pending_read(qp, wr->wr_id);
-				free(entry);
-			}
-			if (bad_wr)
-				*bad_wr = wr;
-			errno = rc;
-			NEX_TRACE("ERROR: post_send send_msg failed");
-			goto ERROR_OUT;
-		}
+        // bool wait_completion = signaled;
+		// occupy slots in tx queue
+        int tx_slot = -1;
+        rc = nex_send_msg(qp, &hdr,
+                          payload_iovcnt ? payload_iov : NULL,
+                          payload_iovcnt, payload_len,
+                          wait_completion,
+                          &tx_slot);
+        if (rc) {
+            if (wr->opcode == IBV_WR_RDMA_READ) {
+                struct nex_pending_read *entry =
+                    nex_take_pending_read(qp, wr->wr_id);
+                free(entry);
+            }
+            if (bad_wr)
+                *bad_wr = wr;
+            errno = rc;
+            NEX_ERROR("post_send send_msg failed");
+            goto ERROR_OUT;
+        }
 
-	    NEX_TRACE("send wr_id=%" PRIu64 " opcode=%u len=%zu qp_pair=%u:%u",
-		       (uint64_t)wr->wr_id, hdr.opcode, total_len,
-		       qp->vqp.qp.qp_num, qp->remote_qp_num);
+        NEX_TRACE("send wr_id=%" PRIu64 " opcode=%u len=%zu qp_pair=%u:%u",
+               (uint64_t)wr->wr_id, hdr.opcode, total_len,
+               qp->vqp.qp.qp_num, qp->remote_qp_num);
 
-		if (wr->opcode == IBV_WR_RDMA_READ)
-			continue;
+        if (wr->opcode == IBV_WR_RDMA_READ)
+            continue;
 
-		if (signaled) {
-			enum ibv_wc_opcode wc_op =
-				(wr->opcode == IBV_WR_RDMA_WRITE || wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM)
-					? IBV_WC_RDMA_WRITE
-					: IBV_WC_SEND;
-
-			struct ibv_wc send_wc = {
-				.wr_id   = wr->wr_id,
-				.status  = IBV_WC_SUCCESS,
-				.opcode  = wc_op,
-				.byte_len= (uint32_t)total_len,
-				.qp_num  = qp->vqp.qp.qp_num,
-			};
-
-			nex_cq_push(qp->send_cq, &send_wc);
-		}
+        // if (signaled) {
+		// everyone here needs to wait for completion
+            enum ibv_wc_opcode wc_op =
+                (wr->opcode == IBV_WR_RDMA_WRITE || wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM)
+                    ? IBV_WC_RDMA_WRITE
+                    : IBV_WC_SEND;
+            nex_txq_push(qp, wr->wr_id, wc_op, (uint32_t)total_len, tx_slot, signaled);
+        // }
 	}
 
 	accvm_syms.compressT(1.0f);
@@ -1160,7 +1334,7 @@ ERROR_OUT:
 static void *nex_rx_worker(void *arg)
 {
 	
-	accvm_syms.compressT(1000.0f);
+	accvm_syms.compressT(2000.0f);
 
 	struct nex_qp *qp = arg;
 	uint8_t *payload_buf = NULL;
@@ -1173,14 +1347,12 @@ static void *nex_rx_worker(void *arg)
 
 	for (;;) {
 		payload = NULL;
-		payload_len = 0;
 		payload_from_pending = false;
 		
 		struct nex_pending_msg *pending = nex_pop_pending_msg(qp);
 		if (pending) {
 			hdr = pending->hdr;
 			payload = pending->payload;
-			payload_len = pending->payload_len;
 			payload_from_pending = true;
 			   NEX_TRACE("replay pending hdr wr_id=%" PRIu64 " opcode=%u len=%u status=%u qp_pair=%u:%u",
 				   hdr.wr_id, hdr.opcode, hdr.length, hdr.status,
@@ -1192,6 +1364,7 @@ static void *nex_rx_worker(void *arg)
 				break;
 			if (nex_read_full(qp->rx_fd, &hdr, sizeof(hdr), 0))  // header: no perf model
 				break;
+			accvm_syms.changeEpoch(250, 16);
 
 			bool expect_payload = (hdr.opcode == NEX_MSG_SEND ||
 				        hdr.opcode == NEX_MSG_RDMA_WRITE ||
@@ -1217,8 +1390,7 @@ static void *nex_rx_worker(void *arg)
 				if (nex_read_full(qp->rx_fd, payload_buf, hdr.length, 1))  // payload: apply perf model
 					break;
 				payload = payload_buf;
-				payload_len = hdr.length;
-				   NEX_TRACE("read completed: rx payload wr_id=%" PRIu64 " len=%u qp_pair=%u:%u",
+				NEX_TRACE("read completed: rx payload wr_id=%" PRIu64 " len=%u qp_pair=%u:%u",
 					   hdr.wr_id, hdr.length, qp->vqp.qp.qp_num, qp->remote_qp_num);
 			}
 		}
@@ -1232,7 +1404,7 @@ static void *nex_rx_worker(void *arg)
 
 			if (!nex_try_take_recv(qp, &entry_copy)) {
 				/* No RECV posted yet: queue for later and continue */
-				NEX_TRACE("ERROR: send without posted recv, wr_id=%" PRIu64 " qp_pair=%u:%u", hdr.wr_id,
+				fprintf(stderr, "ERROR: send without posted recv, wr_id=%" PRIu64 " qp_pair=%u:%u", hdr.wr_id,
 					   qp->vqp.qp.qp_num, qp->remote_qp_num);
 				fflush(stderr);
 				exit(1);
@@ -1249,6 +1421,7 @@ static void *nex_rx_worker(void *arg)
 				copy_len = hdr.length;
 				if (copy_len > entry_copy.sge.length)
 					copy_len = entry_copy.sge.length;
+				// DOTO, optimize, no memcpy.
 				memcpy((void *)(uintptr_t)entry_copy.sge.addr, payload, copy_len);
 			}
 
@@ -1315,7 +1488,7 @@ static void *nex_rx_worker(void *arg)
 				if (!nex_try_take_recv(qp, &entry_copy)) {
 					// If no posted RECV
 					payload = NULL;
-					NEX_TRACE("ERROR: rdma_write_imm without posted recv, wr_id=%" PRIu64 " qp_pair=%u:%u",
+					NEX_ERROR("rdma_write_imm without posted recv, wr_id=%" PRIu64 " qp_pair=%u:%u",
 								hdr.wr_id, qp->vqp.qp.qp_num, qp->remote_qp_num);
 					fflush(stderr);
 					exit(1);
@@ -1381,6 +1554,8 @@ static void *nex_rx_worker(void *arg)
 			if (!mr || !(mr->vmr.access & IBV_ACCESS_REMOTE_READ)) {
 				resp.status = NEX_MSG_STATUS_REMOTE_ERROR;
 				resp.length = 0;
+				NEX_ERROR("rdma_read remote error: invalid rkey=0x%x qp_pair=%u:%u",
+							hdr.rkey, qp->vqp.qp.qp_num, qp->remote_qp_num);
 			} else {
 				uintptr_t base = (uintptr_t)mr->vmr.ibv_mr.addr;
 				uintptr_t end = base + mr->vmr.ibv_mr.length;
@@ -1388,13 +1563,26 @@ static void *nex_rx_worker(void *arg)
 				if (src < base || src + hdr.length > end) {
 					resp.status = NEX_MSG_STATUS_REMOTE_ERROR;
 					resp.length = 0;
+					NEX_ERROR("rdma_read remote error: invalid rkey=0x%x qp_pair=%u:%u",
+							hdr.rkey, qp->vqp.qp.qp_num, qp->remote_qp_num);
 				} else if (hdr.length) {
-					resp_buf = src;
+					resp_buf = (uint8_t *)src;
 				}
 			}
-			if (nex_send_msg(qp, &resp, resp_buf, resp.length))
-				   NEX_TRACE("failed to send rdma_read_resp qp_pair=%u:%u",
-					   qp->vqp.qp.qp_num, qp->remote_qp_num);
+			struct iovec resp_iov = {
+				.iov_base = resp_buf,
+				.iov_len = resp.length,
+			};
+            int tx_slot = -1;
+            if (nex_send_msg(qp, &resp,
+                             (resp.length && resp_buf) ? &resp_iov : NULL,
+                             (resp.length && resp_buf) ? 1 : 0,
+                             resp.length,
+                             false,
+                             &tx_slot))
+                   NEX_TRACE("failed to send rdma_read_resp qp_pair=%u:%u",
+                           qp->vqp.qp.qp_num, qp->remote_qp_num);
+
 			if (payload_from_pending)
 				free(payload);
 			break;
@@ -1618,14 +1806,24 @@ static int nex_qp_establish_sync(struct nex_qp *qp)
 	qp->tx_fd = data_fd;
 	qp->rx_fd = data_fd;
 	qp->rx_running = true;
-	if (pthread_create(&qp->rx_thread, NULL, nex_rx_worker, qp)) {
-		int err = errno ? errno : EIO;
-		qp->rx_running = false;
-		close(data_fd);
-		qp->tx_fd = qp->rx_fd = -1;
-		return err;
-	}
-	return 0;
+    if (pthread_create(&qp->rx_thread, NULL, nex_rx_worker, qp)) {
+        int err = errno ? errno : EIO;
+        qp->rx_running = false;
+        close(data_fd);
+        qp->tx_fd = qp->rx_fd = -1;
+        return err;
+    }
+    // start tx completion worker
+    if (pthread_create(&qp->tx_thread, NULL, nex_tx_worker, qp)) {
+        int err = errno ? errno : EIO;
+        nex_shm_shutdown(unified_fd);
+        pthread_join(qp->rx_thread, NULL);
+        nex_shm_close(unified_fd);
+		fprintf(stderr, "Failed to create tx thread\n");
+		exit(1);
+
+    }
+    return 0;
 
 
 close_listen:
@@ -1636,13 +1834,7 @@ close_listen:
 
 	/* after role is determined */
 	struct nex_context* ctx = qp->ctx;
-	int lid = ctx->lid;
-	int remote_lid = qp->remote_lid;
-	int qp_num = qp->vqp.qp.qp_num;
-	int remote_qp_num = qp->remote_qp_num;
-
 	char* service_id = nex_get_service_id(qp);
-
 	int unified_fd = -1;
 
 	int rc = nex_shm_dial(service_id, &unified_fd);
@@ -1658,14 +1850,26 @@ close_listen:
 	qp->tx_fd = unified_fd;
 	qp->rx_fd = unified_fd;
 	qp->rx_running = true;
-	if (pthread_create(&qp->rx_thread, NULL, nex_rx_worker, qp)) {
-		int err = errno ? errno : EIO;
-		qp->rx_running = false;
-		nex_shm_close(unified_fd);
-		qp->tx_fd = qp->rx_fd = -1;
-		return err;
-	}
-	return 0;
+    if (pthread_create(&qp->rx_thread, NULL, nex_rx_worker, qp)) {
+        int err = errno ? errno : EIO;
+        qp->rx_running = false;
+        nex_shm_close(unified_fd);
+        qp->tx_fd = qp->rx_fd = -1;
+        return err;
+    }
+    // start tx completion worker
+    pthread_spin_lock(&qp->tx_lock);
+    qp->tx_running = true;
+    pthread_spin_unlock(&qp->tx_lock);
+    if (pthread_create(&qp->tx_thread, NULL, nex_tx_worker, qp)) {
+        int err = errno ? errno : EIO;
+        nex_shm_shutdown(unified_fd);
+        pthread_join(qp->rx_thread, NULL);
+        nex_shm_close(unified_fd);
+		fprintf(stderr, "Failed to create tx thread\n");
+		exit(1);
+    }
+    return 0;
 
 #endif
 }
@@ -1684,7 +1888,7 @@ static int nex_qp_reserve(struct nex_qp *qp)
     uint32_t new = __sync_add_and_fetch(ctx->qp_counter, 1);
     uint32_t limit = ctx->qp_limit ? ctx->qp_limit : NEX_DEFAULT_MAX_QP;
     if (new > limit) {
-		NEX_TRACE("ERROR: QP limit exceeded (%u) new=%u", limit, new);
+		NEX_ERROR("QP limit exceeded (%u) new=%u", limit, new);
         __sync_sub_and_fetch(ctx->qp_counter, 1);
         errno = ENOSPC;
         return -1;

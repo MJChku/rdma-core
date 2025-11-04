@@ -63,6 +63,8 @@ struct nex_pending_read {
 	struct nex_pending_read *next;
 };
 
+struct nex_tx_entry;
+
 struct nex_qp {
 	struct verbs_qp vqp;
 	struct nex_context *ctx;
@@ -96,6 +98,23 @@ struct nex_qp {
 	pthread_spinlock_t pending_lock;
 
 	pthread_t connect_thread;
+
+	// Async TX completion support
+	struct nex_tx_entry *tx_queue;
+	uint32_t tx_qsize;
+	uint32_t tx_head;
+	uint32_t tx_tail;
+	pthread_spinlock_t tx_lock;
+	bool tx_running;
+	pthread_t tx_thread;
+};
+
+struct nex_tx_entry {
+	uint64_t wr_id;
+	enum ibv_wc_opcode wc_op;
+	uint32_t byte_len;
+	int slot;
+	bool signaled;
 };
 
 struct nex_mr {
