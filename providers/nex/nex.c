@@ -248,6 +248,46 @@ static int nex_read_full(int fd, void *buf, size_t len, int apply_perf)
 	return 0;
 }
 
+static int nex_read_fullv(int fd, const struct iovec *iov, int iovcnt,
+                          size_t total_len, int apply_perf, bool wait_completion, int *slot_out)
+{
+    if (!iov || iovcnt <= 0 || total_len == 0) {
+        if (slot_out)
+            *slot_out = -1;
+        return 0;
+    }
+#ifdef USE_TCP
+    // Fall back to contiguous read if TCP path is ever used; otherwise unused
+    size_t remaining = total_len;
+    int idx = 0;
+    while (remaining > 0 && idx < iovcnt) {
+        uint8_t *p = (uint8_t *)iov[idx].iov_base;
+        size_t len = iov[idx].iov_len;
+        while (len > 0) {
+            ssize_t n = read(fd, p, len);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                return -1;
+            }
+            if (n == 0)
+                return -1;
+            p += n;
+            len -= (size_t)n;
+            remaining -= (size_t)n;
+        }
+        ++idx;
+    }
+    if (slot_out)
+        *slot_out = -1;
+#else
+    ssize_t n = nex_shm_readv(fd, iov, iovcnt, apply_perf, wait_completion, slot_out);
+    if (n < 0 || (size_t)n != total_len)
+        return -1;
+#endif
+    return 0;
+}
+
 static int nex_map_qp_counter(struct nex_context *ctx)
 {
 	if (ctx->qp_counter)
@@ -1357,39 +1397,16 @@ static void *nex_rx_worker(void *arg)
 				   qp->vqp.qp.qp_num, qp->remote_qp_num);
 			free(pending);
 		} else {
-			// get header then get payload
+			// get header; op handlers will stream payload directly as needed
 			if (!qp->rx_running)
 				break;
 			if (nex_read_full(qp->rx_fd, &hdr, sizeof(hdr), 0))  // header: no perf model
 				break;
 			accvm_syms.changeEpoch(250, 16);
 
-            // Do not prefetch payload here; op handlers will stream into
-            // destination via nex_shm_readv to avoid extra copies.
-            bool expect_payload = false;
-			
-			   NEX_TRACE("rx header wr_id=%" PRIu64 " opcode=%u len=%u status=%u hdr.length=%u qp_pair=%u:%u",
+			NEX_TRACE("rx header wr_id=%" PRIu64 " opcode=%u len=%u status=%u hdr.length=%u qp_pair=%u:%u",
 				   hdr.wr_id, hdr.opcode, hdr.length, hdr.status, hdr.length,
 				   qp->vqp.qp.qp_num, qp->remote_qp_num);
-
-			if (expect_payload && hdr.length) {
-				// Reuse or grow buffer
-				if (hdr.length > payload_capacity) {
-					size_t new_capacity = hdr.length;
-					if (new_capacity < initial_capacity)
-						new_capacity = initial_capacity;
-					uint8_t *new_buf = realloc(payload_buf, new_capacity);
-					if (!new_buf)
-						break;
-					payload_buf = new_buf;
-					payload_capacity = new_capacity;
-				}
-				if (nex_read_full(qp->rx_fd, payload_buf, hdr.length, 1))  // payload: apply perf model
-					break;
-				payload = payload_buf;
-				NEX_TRACE("read completed: rx payload wr_id=%" PRIu64 " len=%u qp_pair=%u:%u",
-					   hdr.wr_id, hdr.length, qp->vqp.qp.qp_num, qp->remote_qp_num);
-			}
 		}
 
 		bool should_exit = false;
@@ -1413,19 +1430,18 @@ static void *nex_rx_worker(void *arg)
 			size_t read_bytes = 0;
 			enum ibv_wc_status wc_status = IBV_WC_SUCCESS;
 
-			if (to_read) {
-				struct iovec iov = {
-					.iov_base = (void *)(uintptr_t)entry_copy.sge.addr,
-					.iov_len  = to_read,
-				};
-				int slot = -1;
-				ssize_t n = nex_shm_readv(qp->rx_fd, &iov, 1, 1, true, &slot);
-				if (n < 0 || (size_t)n != to_read) {
-					wc_status = IBV_WC_LOC_LEN_ERR;
-				} else {
-					read_bytes = (size_t)n;
-				}
-			}
+            if (to_read) {
+                struct iovec iov = {
+                    .iov_base = (void *)(uintptr_t)entry_copy.sge.addr,
+                    .iov_len  = to_read,
+                };
+                int rc = nex_read_fullv(qp->rx_fd, &iov, 1, to_read, 1, true, NULL);
+                if (rc != 0) {
+                    wc_status = IBV_WC_LOC_LEN_ERR;
+                } else {
+                    read_bytes = to_read;
+                }
+            }
 
 			if (read_bytes != want)
 				wc_status = IBV_WC_LOC_LEN_ERR;
@@ -1471,17 +1487,15 @@ static void *nex_rx_worker(void *arg)
                             status = -EINVAL;
                         } else if (hdr.length) {
                             // Stream payload directly from ring into target memory
-                            struct iovec iov = {
-                                .iov_base = (void *)dest,
-                                .iov_len  = hdr.length,
-                            };
-                            int slot = -1;
-                            ssize_t n = nex_shm_readv(qp->rx_fd, &iov, 1, 1, true, &slot);
-                            if (n < 0 || (size_t)n != hdr.length) {
-                                status = -EIO;
-                            } else {
-                                copy_len = (size_t)n;
-                            }
+                        struct iovec iov = {
+                            .iov_base = (void *)dest,
+                            .iov_len  = hdr.length,
+                        };
+                        if (nex_read_fullv(qp->rx_fd, &iov, 1, hdr.length, 1, true, NULL) != 0) {
+                            status = -EIO;
+                        } else {
+                            copy_len = hdr.length;
+                        }
                         }
 					}
 				}
@@ -1520,10 +1534,8 @@ static void *nex_rx_worker(void *arg)
                             .iov_base = (void *)(uintptr_t)entry_copy.sge.addr,
                             .iov_len  = to_copy,
                         };
-                        int slot = -1;
-                        ssize_t n = nex_shm_readv(qp->rx_fd, &iov, 1, 1, true, &slot);
-                        if (n > 0)
-                            copy_len = (size_t)n;
+                        if (nex_read_fullv(qp->rx_fd, &iov, 1, to_copy, 1, true, NULL) == 0)
+                            copy_len = to_copy;
                     }
                 } else {
                     copy_len = 0;
@@ -1634,12 +1646,10 @@ static void *nex_rx_worker(void *arg)
                     remaining -= len;
                 }
                 if (remaining == 0) {
-                    int slot = -1;
-                    ssize_t n = nex_shm_readv(qp->rx_fd, iov, iovcnt, 1, true, &slot);
-                    if (n < 0 || (size_t)n != hdr.length) {
+                    if (nex_read_fullv(qp->rx_fd, iov, iovcnt, hdr.length, 1, true, NULL) != 0) {
                         read_wc.status = IBV_WC_REM_ACCESS_ERR;
                     } else {
-                        read_wc.byte_len = (uint32_t)n;
+                        read_wc.byte_len = (uint32_t)hdr.length;
                     }
                 } else {
                     read_wc.status = IBV_WC_REM_ACCESS_ERR;
