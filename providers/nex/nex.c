@@ -1366,10 +1366,9 @@ static void *nex_rx_worker(void *arg)
 				break;
 			accvm_syms.changeEpoch(250, 16);
 
-			bool expect_payload = (hdr.opcode == NEX_MSG_SEND ||
-				        hdr.opcode == NEX_MSG_RDMA_WRITE ||
-				        hdr.opcode == NEX_MSG_RDMA_WRITE_IMM ||
-				        hdr.opcode == NEX_MSG_RDMA_READ_RESP);
+            bool expect_payload = (hdr.opcode == NEX_MSG_SEND ||
+                                    hdr.opcode == NEX_MSG_RDMA_WRITE ||
+                                    hdr.opcode == NEX_MSG_RDMA_WRITE_IMM);
 			
 			   NEX_TRACE("rx header wr_id=%" PRIu64 " opcode=%u len=%u status=%u hdr.length=%u qp_pair=%u:%u",
 				   hdr.wr_id, hdr.opcode, hdr.length, hdr.status, hdr.length,
@@ -1587,41 +1586,62 @@ static void *nex_rx_worker(void *arg)
 				free(payload);
 			break;
 		}
-		case NEX_MSG_RDMA_READ_RESP: {
-			struct nex_pending_read *entry = nex_take_pending_read(qp, hdr.wr_id);
-			if (!entry) {
-				free(payload);
-				break;
-			}
-			struct ibv_wc read_wc = {
-				.wr_id = hdr.wr_id,
-				.status = (hdr.status == NEX_MSG_STATUS_OK) ?
-					IBV_WC_SUCCESS : IBV_WC_REM_ACCESS_ERR,
-				.opcode = IBV_WC_RDMA_READ,
-				.byte_len = 0,
-				.qp_num = qp->vqp.qp.qp_num,
-			};
-			if (read_wc.status == IBV_WC_SUCCESS) {
-				const uint8_t *src = payload;
-				size_t remaining = hdr.length;
-				for (int i = 0; i < entry->num_sge && remaining; ++i) {
-					size_t chunk = entry->sge[i].length;
-					if (chunk > remaining)
-						chunk = remaining;
-					memcpy((void *)(uintptr_t)entry->sge[i].addr, src, chunk);
-					src += chunk;
-					remaining -= chunk;
-					read_wc.byte_len += (uint32_t)chunk;
-				}
-				if (remaining)
-					read_wc.status = IBV_WC_REM_ACCESS_ERR;
-			}
-			nex_cq_push(qp->send_cq, &read_wc);
-			free(entry);
-			if (payload_from_pending)
-				free(payload);
-			break;
-		}
+        case NEX_MSG_RDMA_READ_RESP: {
+            struct nex_pending_read *entry = nex_take_pending_read(qp, hdr.wr_id);
+            if (!entry) {
+                // Consume and drop payload to keep ring in sync if any
+                if (hdr.length) {
+                    if (hdr.length > payload_capacity) {
+                        size_t new_capacity = hdr.length;
+                        if (new_capacity < initial_capacity)
+                            new_capacity = initial_capacity;
+                        uint8_t *new_buf = realloc(payload_buf, new_capacity);
+                        if (!new_buf)
+                            break;
+                        payload_buf = new_buf;
+                        payload_capacity = new_capacity;
+                    }
+                    (void)nex_read_full(qp->rx_fd, payload_buf, hdr.length, 1);
+                }
+                break;
+            }
+            struct ibv_wc read_wc = {
+                .wr_id = hdr.wr_id,
+                .status = (hdr.status == NEX_MSG_STATUS_OK) ?
+                          IBV_WC_SUCCESS : IBV_WC_REM_ACCESS_ERR,
+                .opcode = IBV_WC_RDMA_READ,
+                .byte_len = 0,
+                .qp_num = qp->vqp.qp.qp_num,
+            };
+            if (read_wc.status == IBV_WC_SUCCESS && hdr.length) {
+                struct iovec iov[NEX_MAX_SGE];
+                int iovcnt = 0;
+                size_t remaining = hdr.length;
+                for (int i = 0; i < entry->num_sge && remaining; ++i) {
+                    size_t len = entry->sge[i].length;
+                    if (len > remaining) len = remaining;
+                    if (len == 0) continue;
+                    iov[iovcnt].iov_base = (void *)(uintptr_t)entry->sge[i].addr;
+                    iov[iovcnt].iov_len  = len;
+                    ++iovcnt;
+                    remaining -= len;
+                }
+                if (remaining == 0) {
+                    int slot = -1;
+                    ssize_t n = nex_shm_readv(qp->rx_fd, iov, iovcnt, 1, true, &slot);
+                    if (n < 0 || (size_t)n != hdr.length) {
+                        read_wc.status = IBV_WC_REM_ACCESS_ERR;
+                    } else {
+                        read_wc.byte_len = (uint32_t)n;
+                    }
+                } else {
+                    read_wc.status = IBV_WC_REM_ACCESS_ERR;
+                }
+            }
+            nex_cq_push(qp->send_cq, &read_wc);
+            free(entry);
+            break;
+        }
 		default:
 			   NEX_TRACE("unknown opcode %u qp_pair=%u:%u", hdr.opcode,
 				   qp->vqp.qp.qp_num, qp->remote_qp_num);

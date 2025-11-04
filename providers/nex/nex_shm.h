@@ -30,6 +30,8 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model);
 ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model);
 ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
                        int apply_perf_model, bool wait_completion, int *slot_out);
+ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
+                      int apply_perf_model, bool wait_completion, int *slot_out);
 int nex_shm_close(int fd);
 int nex_shm_shutdown(int fd);
 void nex_fast_memcpy(void* dst, const void* src, size_t len);

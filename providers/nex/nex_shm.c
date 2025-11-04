@@ -559,6 +559,134 @@ static int nex_shm_copy_from_iov(const struct iovec *iov, int iovcnt,
   return 0;
 }
 
+static int nex_shm_copy_to_iov(const uint8_t *src, size_t len,
+                               const struct iovec *iov, int iovcnt,
+                               size_t *index, size_t *offset)
+{
+  size_t remaining = len;
+  while (remaining > 0) {
+    if (*index >= (size_t)iovcnt)
+      return -1;
+    const struct iovec *cur = &iov[*index];
+    if (cur->iov_len == 0) {
+      ++(*index);
+      *offset = 0;
+      continue;
+    }
+    if (*offset >= cur->iov_len) {
+      ++(*index);
+      *offset = 0;
+      continue;
+    }
+    size_t avail = cur->iov_len - *offset;
+    size_t chunk = avail < remaining ? avail : remaining;
+    memcpy((uint8_t *)cur->iov_base + *offset, src, chunk);
+    src += chunk;
+    remaining -= chunk;
+    *offset += chunk;
+    if (*offset == cur->iov_len) {
+      ++(*index);
+      *offset = 0;
+    }
+  }
+  return 0;
+}
+
+ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
+                      int apply_perf_model, bool wait_completion, int *slot_out)
+{
+  if (iovcnt < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (iovcnt > 0 && !iov) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  size_t total_len = 0;
+  for (int i = 0; i < iovcnt; ++i) {
+    if (SIZE_MAX - total_len < iov[i].iov_len) {
+      errno = EOVERFLOW;
+      return -1;
+    }
+    total_len += iov[i].iov_len;
+  }
+  if (slot_out)
+    *slot_out = -1;
+  if (total_len == 0)
+    return 0;
+
+  struct nex_shm_conn* c = conn_get(fd);
+  if (!c) { errno = EBADF; return -1; }
+
+  int slot = -1;
+  if (apply_perf_model) {
+    slot = accvm_syms.recv_data_qp(c->remote_lid, c->local_lid, total_len,
+                                   c->remote_qp, c->local_qp, wait_completion);
+    if (slot_out)
+      *slot_out = slot;
+  }
+
+  struct shm_ring_hdr* h = c->rx.h;
+  size_t done = 0;
+  int iter = 0;
+  size_t iov_index = 0;
+  size_t iov_offset = 0;
+
+  while (done < total_len) {
+    volatile uint64_t size  = __atomic_load_n(&h->size, __ATOMIC_ACQUIRE);
+    volatile uint64_t head  = __atomic_load_n(&h->head, __ATOMIC_ACQUIRE);
+    volatile uint64_t tail  = __atomic_load_n(&h->tail, __ATOMIC_ACQUIRE);
+    volatile uint64_t avail = head - tail;
+
+    if (avail == 0) {
+      if (__atomic_load_n(&h->closed, __ATOMIC_ACQUIRE)) {
+        errno = EPIPE;
+        return -1;
+      }
+      NEX_TRACE("nex_shm_readv waiting for data (iter=%d)", iter++);
+      yield();
+      continue;
+    }
+
+    iter++;
+    NEX_TRACE_TIMING("nex_shm_readv data (iter=%d) need=%lu done=%lu head=%lu tail=%lu",
+                     iter, (unsigned long)(total_len - done), (unsigned long)done,
+                     (unsigned long)head, (unsigned long)tail);
+
+    size_t need = total_len - done;
+    size_t to_read = (size_t)avail < need ? (size_t)avail : need;
+
+    uint64_t t0 = tail & (size - 1);
+    uint64_t first = size - t0;
+    if (first >= to_read) first = (uint64_t)to_read;
+
+    if (first) {
+      if (nex_shm_copy_to_iov(c->rx.buf + t0, (size_t)first,
+                              iov, iovcnt, &iov_index, &iov_offset)) {
+        errno = EFAULT;
+        return -1;
+      }
+    }
+    if (first < to_read) {
+      size_t remaining = to_read - (size_t)first;
+      if (nex_shm_copy_to_iov(c->rx.buf, remaining,
+                              iov, iovcnt, &iov_index, &iov_offset)) {
+        errno = EFAULT;
+        return -1;
+      }
+    }
+
+    __atomic_store_n(&h->tail, tail + (uint64_t)to_read, __ATOMIC_RELEASE);
+    done += to_read;
+  }
+
+  if (apply_perf_model && wait_completion) {
+    accvm_syms.wait_for_completion(slot);
+  }
+  return (ssize_t)done;
+}
 ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
                        int apply_perf_model, bool wait_completion, int *slot_out) {
 
