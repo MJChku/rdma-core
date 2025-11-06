@@ -14,6 +14,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include <assert.h>
 #include "nex_shm.h"
 
 static int get_nex_id(void);
@@ -410,7 +411,8 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
   if (len == 0) return 0;
 
   if(apply_perf_model){
-    slot = accvm_syms.recv_data_qp(c->remote_lid, c->local_lid, len, c->remote_qp, c->local_qp, true);
+    slot = accvm_syms.recv_data_qp(c->remote_lid, c->local_lid, len,
+                                   c->remote_qp, c->local_qp, 0u, true);
   }
 
   struct shm_ring_hdr* h = c->rx.h;
@@ -473,7 +475,8 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model)
   struct shm_ring_hdr* h = c->tx.h;
   int slot = 0;
   if(apply_perf_model){
-    slot = accvm_syms.send_data_qp(c->local_lid, c->remote_lid, len, c->local_qp, c->remote_qp, true);
+    slot = accvm_syms.send_data_qp(c->local_lid, c->remote_lid, len,
+                                   c->local_qp, c->remote_qp, 0u, true);
   }
   size_t done = 0;
   int iter = 0;
@@ -593,8 +596,11 @@ static int nex_shm_copy_to_iov(const uint8_t *src, size_t len,
 }
 
 ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
-                      int apply_perf_model, bool wait_completion, int *slot_out)
+                      int apply_perf_model, bool wait_completion, int *slot_out,
+                      uint32_t tag)
 {
+  // apply_perf_model = 0; // --- IGNORE ---
+  
   if (iovcnt < 0) {
     errno = EINVAL;
     return -1;
@@ -612,10 +618,12 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
     }
     total_len += iov[i].iov_len;
   }
-  if (slot_out)
-    *slot_out = -1;
-  if (total_len == 0)
-    return 0;
+
+  if (wait_completion) {
+    assert(apply_perf_model);
+    assert(slot_out != NULL);
+  }
+  if (total_len == 0) return 0;
 
   struct nex_shm_conn* c = conn_get(fd);
   if (!c) { errno = EBADF; return -1; }
@@ -623,9 +631,12 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
   int slot = -1;
   if (apply_perf_model) {
     slot = accvm_syms.recv_data_qp(c->remote_lid, c->local_lid, total_len,
-                                   c->remote_qp, c->local_qp, wait_completion);
-    if (slot_out)
-      *slot_out = slot;
+                                   c->remote_qp, c->local_qp, tag, wait_completion);
+    if (slot_out) *slot_out = slot;
+    
+    // has to wait here, otherwise, the application can read data directly before the perf model says its ready
+    accvm_syms.wait_for_completion(slot);
+
   }
 
   struct shm_ring_hdr* h = c->rx.h;
@@ -682,15 +693,15 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
     done += to_read;
   }
 
-  if (apply_perf_model && wait_completion) {
-    accvm_syms.wait_for_completion(slot);
-  }
+  // Do not block here; caller (or upper wrapper) is responsible for waiting
+  // using the returned slot if desired.
   return (ssize_t)done;
 }
 ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
-                       int apply_perf_model, bool wait_completion, int *slot_out) {
+                       int apply_perf_model, bool wait_completion, int *slot_out,
+                       uint32_t tag) {
 
-  // apply_perf_model = 0; // --- IGNORE ---
+  
   if (iovcnt < 0) {
     errno = EINVAL;
     return -1;
@@ -701,6 +712,13 @@ ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
     return -1;
   }
 
+  if(wait_completion){
+    assert(apply_perf_model);
+    assert(slot_out != NULL);
+  }
+
+  // apply_perf_model = 0; // --- IGNORE ---
+  
   size_t total_len = 0;
   for (int i = 0; i < iovcnt; ++i) {
     if (SIZE_MAX - total_len < iov[i].iov_len) {
@@ -720,7 +738,8 @@ ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
       *slot_out = -1;
 
   if(apply_perf_model){
-    slot = accvm_syms.send_data_qp(c->local_lid, c->remote_lid, total_len, c->local_qp, c->remote_qp, wait_completion);
+    slot = accvm_syms.send_data_qp(c->local_lid, c->remote_lid, total_len,
+                                   c->local_qp, c->remote_qp, tag, wait_completion);
     if (slot_out)
         *slot_out = slot;
   }

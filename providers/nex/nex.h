@@ -59,6 +59,7 @@ struct nex_pending_read {
 	uint64_t wr_id;
 	int num_sge;
 	size_t total_len;
+	bool completion_requested;
 	struct ibv_sge sge[NEX_MAX_SGE];
 	struct nex_pending_read *next;
 };
@@ -82,6 +83,7 @@ struct nex_qp {
 	pthread_t rx_thread;
 	uint32_t remote_qp_num;
 	uint32_t remote_lid;
+	bool sq_sig_all;
 	pthread_spinlock_t send_lock;
 	uint8_t *send_buf;
 	size_t send_buf_capacity;
@@ -107,6 +109,7 @@ struct nex_qp {
 	pthread_spinlock_t tx_lock;
 	bool tx_running;
 	pthread_t tx_thread;
+	uint32_t next_tag;
 };
 
 struct nex_tx_entry {

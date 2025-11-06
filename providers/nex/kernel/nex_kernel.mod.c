@@ -56,4 +56,4 @@ __used __section("__versions") = {
 MODULE_INFO(depends, "ib_core");
 
 
-MODULE_INFO(srcversion, "A0333D86D50CA5D79A2D4FF");
+MODULE_INFO(srcversion, "D30C731BC78EECEE711CC15");

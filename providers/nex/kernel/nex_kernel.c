@@ -274,7 +274,7 @@ static int __init nex_init(void)
 
 	/* fill identity */
 	strscpy(ibd->name, NEX_NAME, IB_DEVICE_NAME_MAX);
-	ibd->node_type      = RDMA_NODE_RNIC;
+	ibd->node_type      = RDMA_NODE_IB_CA;
 	ibd->phys_port_cnt  = 1;
 	ibd->num_comp_vectors = 1;
 	ibd->local_dma_lkey = 0;
