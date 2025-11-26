@@ -16,6 +16,7 @@ typedef int (*recv_data_qp_t)(uint32_t src_addr, uint32_t dst_addr, size_t len,
                               bool wait_required);
 typedef void (*wait_for_completion_t)(uint32_t slot);
 typedef void (*changeEpoch_t)(int epoch_duration_ns, int cnt);
+typedef void (*compressTAndChangeEpoch_t)(float percentage, uint64_t epoch_dur, int cnt);
 
 struct accvm_symbols {
     changeEpoch_t changeEpoch;
@@ -25,6 +26,7 @@ struct accvm_symbols {
     send_data_qp_t send_data_qp;
     recv_data_qp_t recv_data_qp;
     wait_for_completion_t wait_for_completion;
+    compressTAndChangeEpoch_t compressTAndChangeEpoch;
 };
 
 int nex_shm_dial(const char* service_id, int* fd_out);

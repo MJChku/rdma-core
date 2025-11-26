@@ -41,10 +41,12 @@ static uint64_t now_ns(void)
 
 // #define DEBUG
 
+#define NEX_INFO(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
+
 #define NEX_ERROR(fmt, ...) fprintf(stderr, "ERROR: nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 
 #ifdef DEBUG
-#define NEX_TRACE(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
+#define NEX_TRACE(fmt, ...) fprintf(stderr, "nex (%d, %lu ns): " fmt "\n", get_nex_id(), now_ns(), ##__VA_ARGS__)
 #else
 #define NEX_TRACE(fmt, ...) do { } while (0)
 #endif
@@ -56,7 +58,30 @@ static uint64_t now_ns(void)
 #define IBV_LINK_SPEED_EDR 8
 #endif
 
-#define EPOCH_PAIR 250, 16
+#define EPOCH_DUR 100
+#define EPOCH_PAIR EPOCH_DUR, 16
+#define EPOCH_PAIR_SHORT EPOCH_DUR, 8
+
+inline void change_epoch(int epoch_dur, int cnt){
+	// mergered with compressT incease compressT is overwritten.
+	accvm_syms.compressTAndChangeEpoch(2000.0f, epoch_dur, cnt);
+}
+
+inline void enter_ib_emu(int epoch_dur, int cnt){
+	accvm_syms.compressTAndChangeEpoch(2000.0f, epoch_dur, cnt);
+	// kick to apply compressT immediately, note the cost is one epoch;
+	// hence we need to change epoch duration to a smaller value first, before reschedule.
+	// when kicking, the epoch round finishes later or ealier than me; if earlier, I pay 1 epoch cost of original duration
+	// if later, I pay the new duration cost.
+	// I don't understand why remove this sched_yield increases latency simulated.
+	sched_yield();
+}
+
+inline void leave_ib_emu(void){
+	// accvm_syms.compressTAndChangeEpoch(1.0f, EPOCH_DUR, 1);
+	accvm_syms.compressT(1.0f);
+	sched_yield();
+}
 
 /* Utility helpers ------------------------------------------------------- */
 
@@ -326,6 +351,9 @@ static int nex_map_qp_counter(struct nex_context *ctx)
 
 static void nex_cq_push(struct nex_cq *cq, const struct ibv_wc *wc)
 {
+	NEX_TRACE("enter cq_push wr_id=%" PRIu64 " opcode=%u status=%u len=%u qp_local=%u",
+	       (uint64_t)wc->wr_id, wc->opcode, wc->status, wc->byte_len,
+	       wc->qp_num);
 	pthread_spin_lock(&cq->lock);
 	uint32_t next_tail = (cq->tail + 1) % cq->capacity;
 	if (next_tail == cq->head) {
@@ -337,17 +365,22 @@ static void nex_cq_push(struct nex_cq *cq, const struct ibv_wc *wc)
 	}
 	cq->entries[cq->tail] = *wc;
 	cq->tail = next_tail;
-       NEX_TRACE("cq_push wr_id=%" PRIu64 " opcode=%u status=%u len=%u qp_local=%u",
+       
+	pthread_spin_unlock(&cq->lock);
+	NEX_TRACE("cq_push wr_id=%" PRIu64 " opcode=%u status=%u len=%u qp_local=%u",
 	       (uint64_t)wc->wr_id, wc->opcode, wc->status, wc->byte_len,
 	       wc->qp_num);
-	pthread_spin_unlock(&cq->lock);
 }
 
 static int nex_cq_pop(struct nex_cq *cq, int num_entries, struct ibv_wc *wc)
 {
 	int produced = 0;
-	// fast path, don't compressT
-	accvm_syms.compressT(10.0f);
+	// enabling this will increase latency simulated
+	// the rational is likely that cq_pop need to be fast
+	if(cq->head == cq->tail) {
+		return 0;
+	}
+	enter_ib_emu(EPOCH_PAIR_SHORT);
 	pthread_spin_lock(&cq->lock);
 	while (produced < num_entries && cq->head != cq->tail) {
 		wc[produced++] = cq->entries[cq->head];
@@ -356,9 +389,9 @@ static int nex_cq_pop(struct nex_cq *cq, int num_entries, struct ibv_wc *wc)
 	pthread_spin_unlock(&cq->lock);
 	if( produced == num_entries ) {
 		//all done
-		accvm_syms.compressT(1.0f);
 		NEX_TRACE("nex_cq_pop produced=%d/%d", produced, num_entries);
 	}
+	leave_ib_emu();
 	return produced;
 }
 
@@ -517,6 +550,7 @@ static int nex_send_msg(struct nex_qp *qp, struct nex_msg_hdr *hdr,
 	hdr->reserved = tag;
     if (nex_write_full(qp->tx_fd, hdr, sizeof(*hdr), 0))  // header: no perf model
         rc = errno ? errno : EIO;
+	NEX_TRACE("nex_send_msg sent hdr");
     if (!rc && payload_len && payload_iovcnt > 0 && payload_iov) {
         if (nex_write_fullv(qp->tx_fd, payload_iov, payload_iovcnt,
 							payload_len, 1, wait_completion, out_slot, tag))  // payload: apply perf model (non-blocking)
@@ -524,13 +558,14 @@ static int nex_send_msg(struct nex_qp *qp, struct nex_msg_hdr *hdr,
 	} else if (out_slot) {
 		*out_slot = -1;
     }
+	NEX_TRACE("nex_send_msg sent payload");
     pthread_spin_unlock(&qp->send_lock);
     return rc;
 }
 
 static void nex_txq_push(struct nex_qp* qp, uint64_t wr_id, enum ibv_wc_opcode op, uint32_t len, int slot, bool signaled)
 {
-    for (;;) {
+	for (;;) {
         pthread_spin_lock(&qp->tx_lock);
         uint32_t next = (qp->tx_tail + 1) % qp->tx_qsize;
         if (next != qp->tx_head) {
@@ -558,6 +593,8 @@ static bool nex_txq_pop(struct nex_qp* qp, struct nex_tx_entry* out)
             *out = qp->tx_queue[qp->tx_head];
             qp->tx_head = (qp->tx_head + 1) % qp->tx_qsize;
             pthread_spin_unlock(&qp->tx_lock);
+			NEX_TRACE("nex_txq_pop popped wr_id=%" PRIu64 " opcode=%u len=%u",
+				(uint64_t)out->wr_id, out->wc_op, out->byte_len);
             return true;
         }
         bool running = qp->tx_running;
@@ -570,10 +607,11 @@ static bool nex_txq_pop(struct nex_qp* qp, struct nex_tx_entry* out)
 
 static void* nex_tx_worker(void* arg)
 {
-	accvm_syms.compressT(1000.0f);
+	enter_ib_emu(EPOCH_PAIR);
     struct nex_qp* qp = arg;
     struct nex_tx_entry entry;
     while (nex_txq_pop(qp, &entry)) {
+		// accvm_syms.changeEpoch(EPOCH_PAIR);
         if (entry.slot >= 0)
             accvm_syms.wait_for_completion((uint32_t)entry.slot);
         struct ibv_wc wc = {
@@ -1181,9 +1219,7 @@ static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 {
 	struct nex_qp *qp = to_nqp(ibqp);
 
-	accvm_syms.compressT(1000.0f);
-	accvm_syms.changeEpoch(EPOCH_PAIR);
-
+	enter_ib_emu(EPOCH_PAIR);
 	// iterate through work requests (wr)
 	// wr has next and sg_list (scatter-gather list)
 	// each sg_list has addr, length, lkey
@@ -1225,8 +1261,7 @@ static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 			sched_yield();
 		}
 	}
-	accvm_syms.compressT(1.0f);
-	// sched_yield();
+	leave_ib_emu();
 	return 0;
 }
 
@@ -1234,8 +1269,8 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			 struct ibv_send_wr **bad_wr)
 {
 
-	accvm_syms.compressT(1000.0f);
-	accvm_syms.changeEpoch(EPOCH_PAIR);
+	enter_ib_emu(EPOCH_PAIR);
+	
 
 	struct nex_qp *qp = to_nqp(ibqp);
 	NEX_TRACE("nex_post_send produced");
@@ -1300,9 +1335,7 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		struct iovec payload_iov[NEX_MAX_SGE];
 		int payload_iovcnt = 0;
 
-		bool wait_completion = true;
-
-    switch (wr->opcode) {
+   		switch (wr->opcode) {
 		case IBV_WR_SEND:
 			hdr.opcode = NEX_MSG_SEND;
 			break;
@@ -1334,10 +1367,13 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			payload_iovcnt = 1;
 			payload_len = (size_t)NEX_RDMA_READ_REQ_PLD;
 			/* Do not wait here; responder will wait on recv side. */
-			wait_completion = false;
 
 			rc = nex_add_pending_read(qp, wr->wr_id, wr->sg_list,
 					wr->num_sge, total_len, completion_requested);
+
+			// send msg doesn't wait for completion right away
+			completion_requested = false;
+
 			if (rc) {
 				if (bad_wr)
 					*bad_wr = wr;
@@ -1372,10 +1408,11 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
         // bool wait_completion = signaled;
 		// occupy slots in tx queue
         int tx_slot = -1;
+		NEX_TRACE("about to send");
         rc = nex_send_msg(qp, &hdr,
                           payload_iovcnt ? payload_iov : NULL,
                           payload_iovcnt, payload_len,
-                          wait_completion,
+                          completion_requested,
                           &tx_slot);
         if (rc) {
             if (wr->opcode == IBV_WR_RDMA_READ) {
@@ -1399,30 +1436,26 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 
 		}
 
-        // if (signaled) {
-		// everyone here needs to wait for completion
-            enum ibv_wc_opcode wc_op =
-                (wr->opcode == IBV_WR_RDMA_WRITE || wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM)
-                    ? IBV_WC_RDMA_WRITE
-                    : IBV_WC_SEND;
-			nex_txq_push(qp, wr->wr_id, wc_op, (uint32_t)total_len, tx_slot, completion_requested);
-        // }
+		// every write needs to wait for completion
+		enum ibv_wc_opcode wc_op =
+			(wr->opcode == IBV_WR_RDMA_WRITE || wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM)
+				? IBV_WC_RDMA_WRITE
+				: IBV_WC_SEND;
+		nex_txq_push(qp, wr->wr_id, wc_op, (uint32_t)total_len, tx_slot, completion_requested);
 	}
 
-	accvm_syms.compressT(1.0f);
-	// sched_yield();
+	leave_ib_emu();
 	return 0;
 
 ERROR_OUT:
-	accvm_syms.compressT(1.0f);
-	// sched_yield();
+	leave_ib_emu();
 	return errno;
 }
 
 static void *nex_rx_worker(void *arg)
 {
 	
-	accvm_syms.compressT(2000.0f);
+	enter_ib_emu(EPOCH_PAIR);
 
 	struct nex_qp *qp = arg;
 	uint8_t *payload_buf = NULL;
@@ -1453,7 +1486,9 @@ static void *nex_rx_worker(void *arg)
 			
 			if (nex_read_full(qp->rx_fd, &hdr, sizeof(hdr), 0))  // header: no perf model
 				break;
-			accvm_syms.changeEpoch(EPOCH_PAIR);
+
+			change_epoch(EPOCH_PAIR);
+
 
 			// NEX_TRACE("rx header, no perf, wr_id=%" PRIu64 " opcode=%u len=%u status=%u hdr.length=%u qp_pair=%u:%u",
 			// 	   hdr.wr_id, hdr.opcode, hdr.length, hdr.status, hdr.length,
@@ -1714,11 +1749,32 @@ static void *nex_rx_worker(void *arg)
                     remaining -= len;
                 }
                 if (remaining == 0) {
+					uint64_t start_ns = now_ns();
 					if (nex_read_fullv(qp->rx_fd, iov, iovcnt, hdr.length, 1, true, NULL, hdr.reserved) != 0) {
                         read_wc.status = IBV_WC_REM_ACCESS_ERR;
 						NEX_ERROR("rdma_read_resp read_fullv failed hdr.length=%u qp_pair=%u:%u",
 								   hdr.length, qp->vqp.qp.qp_num, qp->remote_qp_num);
                     }
+
+					uint64_t dur_ns = now_ns()-start_ns;
+
+					// futher modeling should be added
+					// 130ns per MTU (1024 bytes) + 100ns per MTU PCIe delay
+					// why - dur_ns? because packet processing is parallelized with transmission.
+					int delay_ns = hdr.length/1024 * (40 + 60) - dur_ns;
+					if(delay_ns > 0){
+						int quantum_ns = EPOCH_DUR;
+						if(delay_ns > 10000) quantum_ns = 1000;  
+						int sched_cnt = delay_ns / quantum_ns;
+						NEX_TRACE("rdma_read_resp modeling delay for hdr.length=%u, delay_ns=%d, dur_ns=%d",
+									hdr.length, delay_ns, dur_ns);
+						change_epoch(quantum_ns, sched_cnt);
+						for(int i=0; i<sched_cnt; i++){
+							sched_yield();
+						}
+						NEX_TRACE("rdma_read_resp modeling delay finish");
+					}
+					
                 } else {
 					NEX_ERROR("rdma_read_resp length mismatch wr_id=%" PRIu64 " qp_pair=%u:%u",
 							   hdr.wr_id, qp->vqp.qp.qp_num, qp->remote_qp_num);

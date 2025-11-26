@@ -28,6 +28,8 @@ static uint64_t now_ns(void)
 
 #define NEX_ERROR(fmt, ...) fprintf(stderr, "ERROR: nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 
+#define NEX_INFO(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
+
 #ifdef DEBUG
 #define NEX_TRACE_TIMING(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 #define NEX_TRACE(fmt, ...) fprintf(stderr, "nex (%d, %lu ms): " fmt "\n", get_nex_id(), now_ns() / 1000000, ##__VA_ARGS__)
@@ -66,6 +68,11 @@ int get_accvm_symbols(struct accvm_symbols* syms) {
         NEX_ERROR("getting compressT: %s\n", dlerror());
     }
 
+    syms->compressTAndChangeEpoch = (compressTAndChangeEpoch_t)dlsym(handle, "compressTAndChangeEpoch");
+    if (!syms->compressTAndChangeEpoch) {
+        NEX_ERROR("getting compressTAndChangeEpoch: %s\n", dlerror());
+    }
+
     syms->jailbreakT = (jailbreakT_t)dlsym(handle, "jailbreakT");
     if (!syms->jailbreakT) {
         NEX_ERROR("getting jailbreakT: %s\n", dlerror());
@@ -101,9 +108,9 @@ int get_accvm_symbols(struct accvm_symbols* syms) {
     return 0;
 }
 
-void yield(void){
+inline void yield(void){
+  // likely don't touch this, breaking tight loops, also breaking compressT
   sched_yield();
-  // nanosleep((const struct timespec[]){{0, 1000000}}, NULL);
 }
 
 void nex_fast_memcpy(void* dst, const void* src, size_t len) {
@@ -312,6 +319,7 @@ static int open_remote_ring_wait(const char* name, uint64_t bytes, struct shm_ri
   }
 
   struct shm_ring_hdr* h = (struct shm_ring_hdr*)p;
+  
   // wait until producer published size
   while (true) {
     uint64_t s = __atomic_load_n(&h->size, __ATOMIC_ACQUIRE);
@@ -374,7 +382,7 @@ int nex_shm_dial(const char* service_id, int* fd_out) {
   c->local_qp = parse_u32(lqp);
   c->remote_qp = parse_u32(rqp);
 
-  const uint32_t ring_bytes = 40 * 1024 * 1024; // 40MB per direction
+  const uint64_t ring_bytes = 80 * 1024 * 1024ULL; // 80MB per direction
   
   if ((rc = open_local_ring(local_name, ring_bytes, &c->rx)) != 0) {
     c->in_use = 0; 
@@ -402,7 +410,7 @@ int nex_shm_dial(const char* service_id, int* fd_out) {
 
 
 ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
-  // apply_perf_model = 0; // --- IGNORE ---
+  apply_perf_model = 0; // --- IGNORE ---
   int slot = 0;
  
 
@@ -468,6 +476,7 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
 /* Block until exactly len bytes are written, or error. Returns len on success, -1 on error (errno set). */
 ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model) {
   
+  apply_perf_model = 0; // --- IGNORE ---
   struct nex_shm_conn* c = conn_get(fd);
   if (!c) { errno = EBADF; return -1; }
   if (len == 0) return 0;
@@ -499,6 +508,7 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model)
       NEX_TRACE("nex_shm_write waiting for free space (iter=%d)", iter);
       // pthread_mutex_unlock(&h->lock);
       yield();
+
       continue;
     }
 
@@ -600,7 +610,7 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
                       uint32_t tag)
 {
   // apply_perf_model = 0; // --- IGNORE ---
-  
+
   if (iovcnt < 0) {
     errno = EINVAL;
     return -1;
@@ -740,6 +750,7 @@ ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
   if(apply_perf_model){
     slot = accvm_syms.send_data_qp(c->local_lid, c->remote_lid, total_len,
                                    c->local_qp, c->remote_qp, tag, wait_completion);
+    // NEX_INFO("nex_shm_writev apply_perf_model slot=%d", slot);
     if (slot_out)
         *slot_out = slot;
   }
@@ -776,6 +787,8 @@ ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
     size_t need = total_len - done;
     size_t to_write = (size_t)free_bytes < need ? (size_t)free_bytes : need;
 
+    // NEX_INFO("nex_shm_writev writing (iter=%d) to_write=%lu bytes", iter, (unsigned long)to_write);
+
     uint64_t h0 = head & (size - 1);
     uint64_t first = size - h0;
     if (first >= to_write) first = (uint64_t)to_write;
@@ -798,6 +811,8 @@ ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
 
     __atomic_store_n(&h->head, head + (uint64_t)to_write, __ATOMIC_RELEASE);
     done += to_write;
+
+    // NEX_INFO("nex_shm_writev writing done (iter=%d) copied=%lu bytes", iter, (unsigned long)to_write);
   }
 
   // do not wait here; the caller can await completion asynchronously
