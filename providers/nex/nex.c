@@ -59,8 +59,8 @@ static uint64_t now_ns(void)
 #endif
 
 #define EPOCH_DUR 100
-#define EPOCH_PAIR EPOCH_DUR, 16
-#define EPOCH_PAIR_SHORT EPOCH_DUR, 8
+#define EPOCH_PAIR EPOCH_DUR, 4
+#define EPOCH_PAIR_SHORT EPOCH_DUR, 4
 
 inline void change_epoch(int epoch_dur, int cnt){
 	// mergered with compressT incease compressT is overwritten.

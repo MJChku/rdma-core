@@ -17,7 +17,13 @@
 #include <assert.h>
 #include "nex_shm.h"
 
+#define SHM_RING_GENERATION_INVALID UINT64_MAX
+
+#define CAP_MAX_TRANSFER (1ULL << 32) // 4GB
+#define MIN(a,b) (((a)<(b))?(a):(b))
+
 static int get_nex_id(void);
+static bool lid_is_local(uint32_t lid);
 
 static uint64_t now_ns(void)
 {
@@ -30,6 +36,7 @@ static uint64_t now_ns(void)
 
 #define NEX_INFO(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 
+// #define DEBUG
 #ifdef DEBUG
 #define NEX_TRACE_TIMING(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 #define NEX_TRACE(fmt, ...) fprintf(stderr, "nex (%d, %lu ms): " fmt "\n", get_nex_id(), now_ns() / 1000000, ##__VA_ARGS__)
@@ -145,6 +152,20 @@ static int get_nex_id(void){
 	return nex_id;
 }
 
+static int lid_owner_rank(uint32_t lid)
+{
+	if (lid < 4096)
+		return 0;
+	return (int)(((uint64_t)lid - 4096ull) / 64ull) + 1;
+}
+
+static bool lid_is_local(uint32_t lid)
+{
+	int owner = lid_owner_rank(lid);
+	int self = get_nex_id()/64 + 1;
+	return owner == self;
+}
+
 
 // ---------- ring layout ----------
 struct shm_ring_hdr {
@@ -153,6 +174,7 @@ struct shm_ring_hdr {
   volatile uint64_t tail;   // consumer moves tail forward
   volatile uint64_t size;   // power-of-two
   volatile uint64_t closed;   // 0=open, 1=closed
+  volatile uint64_t generation;
 };
 
 struct shm_ring {
@@ -171,6 +193,10 @@ struct nex_shm_conn {
   uint32_t        remote_lid;
   uint32_t        local_qp;
   uint32_t        remote_qp;
+  char            rx_name[256];
+  char            tx_name[256];
+  int             rx_owned;
+  int             tx_owned;
 };
 
 #ifndef NEX_SHM_MAX_CONN
@@ -277,6 +303,10 @@ static int open_local_ring(const char* name, uint64_t bytes, struct shm_ring* ou
   __atomic_store_n(&h->closed, 0u, __ATOMIC_RELEASE);
   __atomic_thread_fence(__ATOMIC_RELEASE);
   __atomic_store_n(&h->size, sz, __ATOMIC_RELEASE);
+  uint64_t generation = now_ns();
+  if (generation == SHM_RING_GENERATION_INVALID)
+    generation--;
+  __atomic_store_n(&h->generation, generation, __ATOMIC_RELEASE);
 
   out->h = h;
   out->buf = (uint8_t*)(h + 1);
@@ -324,6 +354,12 @@ static int open_remote_ring_wait(const char* name, uint64_t bytes, struct shm_ri
   while (true) {
     uint64_t s = __atomic_load_n(&h->size, __ATOMIC_ACQUIRE);
     if (s==sz) break;
+    yield();
+  }
+  while (true) {
+    uint64_t gen = __atomic_load_n(&h->generation, __ATOMIC_ACQUIRE);
+    if (gen != 0 && gen != SHM_RING_GENERATION_INVALID)
+      break;
     yield();
   }
 
@@ -381,6 +417,10 @@ int nex_shm_dial(const char* service_id, int* fd_out) {
   c->remote_lid = parse_u32(rlid);
   c->local_qp = parse_u32(lqp);
   c->remote_qp = parse_u32(rqp);
+  c->rx_owned = 0;
+  c->tx_owned = 0;
+  c->rx_name[0] = '\0';
+  c->tx_name[0] = '\0';
 
   const uint64_t ring_bytes = 80 * 1024 * 1024ULL; // 80MB per direction
   
@@ -389,17 +429,37 @@ int nex_shm_dial(const char* service_id, int* fd_out) {
     NEX_TRACE("ERROR: nex_shm_dial open_local_ring failed local_name=%s error=%d", local_name, rc);
     return -rc; 
   }
+  c->rx_owned = 1;
+  strncpy(c->rx_name, local_name, sizeof(c->rx_name) - 1);
+  c->rx_name[sizeof(c->rx_name) - 1] = '\0';
 
   NEX_TRACE("created/opened local shm %s (size=%lu)", local_name, c->rx.h->size);
 
-  if ((rc = open_remote_ring_wait(remote_name, ring_bytes, &c->tx)) != 0) {
-    // cleanup local on failure
-    NEX_TRACE("ERROR: nex_shm_dial open_remote_ring_wait failed remote_name=%s error=%d", remote_name, rc);
-    munmap(c->rx.h, c->rx.map_len);
-    close(c->rx.fd);
-    shm_unlink(local_name);
-    c->in_use = 0;
-    return -rc;
+  bool remote_is_local = lid_is_local(c->remote_lid);
+  // remote_is_local = true;
+  if (remote_is_local) {
+    if ((rc = open_remote_ring_wait(remote_name, ring_bytes, &c->tx)) != 0) {
+      NEX_TRACE("ERROR: nex_shm_dial open_remote_ring_wait failed remote_name=%s error=%d", remote_name, rc);
+      munmap(c->rx.h, c->rx.map_len);
+      close(c->rx.fd);
+      shm_unlink(local_name);
+      c->in_use = 0;
+      return -rc;
+    }
+    strncpy(c->tx_name, remote_name, sizeof(c->tx_name) - 1);
+    c->tx_name[sizeof(c->tx_name) - 1] = '\0';
+  } else {
+    if ((rc = open_local_ring(remote_name, ring_bytes, &c->tx)) != 0) {
+      NEX_TRACE("ERROR: nex_shm_dial open_local_ring for remote failed remote_name=%s error=%d", remote_name, rc);
+      munmap(c->rx.h, c->rx.map_len);
+      close(c->rx.fd);
+      shm_unlink(local_name);
+      c->in_use = 0;
+      return -rc;
+    }
+    c->tx_owned = 1;
+    strncpy(c->tx_name, remote_name, sizeof(c->tx_name) - 1);
+    c->tx_name[sizeof(c->tx_name) - 1] = '\0';
   }
 
   NEX_TRACE("connected to remote shm %s (size=%lu)", remote_name, c->tx.h->size);
@@ -655,6 +715,9 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
   size_t iov_index = 0;
   size_t iov_offset = 0;
 
+  size_t orig_total_len = total_len;
+  total_len = MIN(total_len, CAP_MAX_TRANSFER);
+
   while (done < total_len) {
     volatile uint64_t size  = __atomic_load_n(&h->size, __ATOMIC_ACQUIRE);
     volatile uint64_t head  = __atomic_load_n(&h->head, __ATOMIC_ACQUIRE);
@@ -705,7 +768,7 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
 
   // Do not block here; caller (or upper wrapper) is responsible for waiting
   // using the returned slot if desired.
-  return (ssize_t)done;
+  return (ssize_t)orig_total_len;
 }
 ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
                        int apply_perf_model, bool wait_completion, int *slot_out,
@@ -762,6 +825,9 @@ ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
   size_t iov_index = 0;
   size_t iov_offset = 0;
 
+  size_t orig_total_len = total_len;
+  total_len = MIN(total_len, CAP_MAX_TRANSFER);
+
   while (done < total_len) {
     volatile uint64_t size = __atomic_load_n(&h->size, __ATOMIC_ACQUIRE);
     volatile uint64_t head = __atomic_load_n(&h->head, __ATOMIC_ACQUIRE);
@@ -817,17 +883,25 @@ ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
 
   // do not wait here; the caller can await completion asynchronously
 
-  return (ssize_t)done;
+  return (ssize_t)orig_total_len;
 }
 
 // optional cleanup if you need it
 int nex_shm_close(int fd) {
   struct nex_shm_conn* c = conn_get(fd);
   if (!c) return EBADF;
+  if (c->rx.h)
+    __atomic_store_n(&c->rx.h->generation, SHM_RING_GENERATION_INVALID, __ATOMIC_RELEASE);
+  if (c->tx.h)
+    __atomic_store_n(&c->tx.h->generation, SHM_RING_GENERATION_INVALID, __ATOMIC_RELEASE);
   if (c->rx.h) munmap(c->rx.h, c->rx.map_len);
-  if (c->tx.h) munmap(c->tx.h, c->tx.map_len);
+  if (c->tx.h && c->tx.h != c->rx.h) munmap(c->tx.h, c->tx.map_len);
   if (c->rx.fd >= 0) close(c->rx.fd);
-  if (c->tx.fd >= 0) close(c->tx.fd);
+  if (c->tx.fd >= 0 && c->tx.fd != c->rx.fd) close(c->tx.fd);
+  if (c->rx_owned && c->rx_name[0])
+    shm_unlink(c->rx_name);
+  if (c->tx_owned && c->tx_name[0])
+    shm_unlink(c->tx_name);
   c->in_use = 0;
   return 0;
 }
@@ -837,8 +911,16 @@ int nex_shm_shutdown(int fd) {
   if (!c) return EBADF;
 
   NEX_TRACE("nex_shm_shutdown fd=%d", fd);
-  __atomic_store_n(&c->tx.h->closed, 1, __ATOMIC_RELEASE);
-  __atomic_store_n(&c->rx.h->closed, 1, __ATOMIC_RELEASE);
+  if (c->tx.h) {
+    __atomic_store_n(&c->tx.h->closed, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&c->tx.h->generation, SHM_RING_GENERATION_INVALID, __ATOMIC_RELEASE);
+  }
+  if (c->rx.h && c->rx.h != c->tx.h) {
+    __atomic_store_n(&c->rx.h->closed, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&c->rx.h->generation, SHM_RING_GENERATION_INVALID, __ATOMIC_RELEASE);
+  } else if (c->rx.h == c->tx.h && c->rx.h) {
+    __atomic_store_n(&c->rx.h->closed, 1, __ATOMIC_RELEASE);
+  }
 
   // Optional nudge: advance head by 0 or write a 1-byte noop so an empty reader wakes
   // (usually not needed if it polls/yields)
