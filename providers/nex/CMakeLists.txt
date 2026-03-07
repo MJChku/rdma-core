@@ -2,6 +2,7 @@ add_compile_options(-O2)
 rdma_provider(nex
   nex.c
   nex_shm.c
+  nex_tcp.c
   cm/nex_cm.c
 )
 

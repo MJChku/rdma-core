@@ -19,7 +19,8 @@
 
 #define SHM_RING_GENERATION_INVALID UINT64_MAX
 
-#define CAP_MAX_TRANSFER (1ULL << 32) // 4GB
+// 10MB
+#define CAP_MAX_TRANSFER (10 * 1024 * 1024ULL)
 #define MIN(a,b) (((a)<(b))?(a):(b))
 
 static int get_nex_id(void);
@@ -73,51 +74,97 @@ int get_accvm_symbols(struct accvm_symbols* syms) {
     syms->compressT = (compressT_t)dlsym(handle, "compressT");
     if (!syms->compressT) {
         NEX_ERROR("getting compressT: %s\n", dlerror());
+        return -1;
     }
 
     syms->compressTAndChangeEpoch = (compressTAndChangeEpoch_t)dlsym(handle, "compressTAndChangeEpoch");
     if (!syms->compressTAndChangeEpoch) {
         NEX_ERROR("getting compressTAndChangeEpoch: %s\n", dlerror());
+        return -1;
     }
 
     syms->jailbreakT = (jailbreakT_t)dlsym(handle, "jailbreakT");
     if (!syms->jailbreakT) {
         NEX_ERROR("getting jailbreakT: %s\n", dlerror());
+        return -1;
     }
 
     syms->endJailbreakT = (end_jailbreakT_t)dlsym(handle, "endJailbreakT");
     if (!syms->endJailbreakT) {
         NEX_ERROR("getting endJailbreakT: %s\n", dlerror());
+        return -1;
     }
 
     syms->changeEpoch = (changeEpoch_t)dlsym(handle, "changeEpoch");
     if (!syms->changeEpoch) {
         NEX_ERROR("getting changeEpoch: %s\n", dlerror());
+        return -1;
     }
 
     syms->send_data_qp = (send_data_qp_t)dlsym(handle, "send_data_qp");
     if (!syms->send_data_qp) {
         NEX_ERROR("getting send_data_qp: %s\n", dlerror());
+        return -1;
     }
 
     syms->recv_data_qp = (recv_data_qp_t)dlsym(handle, "recv_data_qp");
     if (!syms->recv_data_qp) {
         NEX_ERROR("getting recv_data_qp: %s\n", dlerror());
+        return -1;
     }
 
     syms->wait_for_completion = (wait_for_completion_t)dlsym(handle, "wait_for_completion");
     if (!syms->wait_for_completion) {
         NEX_ERROR("getting wait_for_completion: %s\n", dlerror());
+        return -1;
     }
 
-    if (!syms->send_data_qp || !syms->recv_data_qp)
+    syms->nex_sched_init = (nex_sched_init_t)dlsym(handle, "nex_sched_init");
+    if (!syms->nex_sched_init) {
+        NEX_ERROR("getting nex_sched_init: %s\n", dlerror());
         return -1;
+    }
+
+    syms->nex_sched_new_fiber = (nex_sched_new_fiber_t)dlsym(handle, "nex_sched_new_fiber");
+    if (!syms->nex_sched_new_fiber) {
+        NEX_ERROR("getting nex_sched_new_fiber: %s\n", dlerror());
+        return -1;
+    }
+
+    syms->nex_sched_shutdown = (nex_sched_shutdown_t)dlsym(handle, "nex_sched_shutdown");
+    if (!syms->nex_sched_shutdown) {
+        NEX_ERROR("getting nex_sched_shutdown: %s\n", dlerror());
+        return -1;
+    }
+
+    syms->nex_fiber_yield = (nex_fiber_yield_t)dlsym(handle, "nex_fiber_yield");
+    if (!syms->nex_fiber_yield) {
+        NEX_ERROR("getting nex_fiber_yield: %s\n", dlerror());
+        return -1;
+    }
+
+    syms->nex_fiber_idle_yield = (nex_fiber_idle_yield_t)dlsym(handle, "nex_fiber_idle_yield");
+    if (!syms->nex_fiber_idle_yield) {
+        NEX_ERROR("getting nex_fiber_idle_yield: %s\n", dlerror());
+        return -1;
+    }
+
     return 0;
 }
 
-inline void yield(void){
-  // likely don't touch this, breaking tight loops, also breaking compressT
-  sched_yield();
+inline void nex_fiber_yield(void)
+{
+  accvm_syms.nex_fiber_yield();
+}
+
+inline void nex_fiber_idle_yield(void)
+{
+  accvm_syms.nex_fiber_idle_yield();
+}
+
+inline void nex_wait_for_completion(uint32_t slot)
+{
+  accvm_syms.wait_for_completion(slot);
 }
 
 void nex_fast_memcpy(void* dst, const void* src, size_t len) {
@@ -152,17 +199,43 @@ static int get_nex_id(void){
 	return nex_id;
 }
 
+static uint32_t get_nex_per_rack(void)
+{
+	static int initialized = 0;
+	static uint32_t per_rack = 64;
+
+	if (__atomic_load_n(&initialized, __ATOMIC_ACQUIRE))
+		return per_rack;
+
+	const char *env_p = getenv("NEX_PER_RACK");
+	if (env_p && *env_p) {
+		errno = 0;
+		char *endp = NULL;
+		unsigned long v = strtoul(env_p, &endp, 10);
+		if (errno == 0 && endp && *endp == '\0' && v > 0 && v <= UINT32_MAX) {
+			per_rack = (uint32_t)v;
+		} else {
+			NEX_ERROR("invalid NEX_PER_RACK='%s', using %u", env_p, per_rack);
+		}
+	}
+
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+  printf("nex_shm: NEX_PER_RACK=%u\n", per_rack);
+	return per_rack;
+}
+
 static int lid_owner_rank(uint32_t lid)
 {
 	if (lid < 4096)
 		return 0;
-	return (int)(((uint64_t)lid - 4096ull) / 64ull) + 1;
+	return (int)(((uint64_t)lid - 4096ull) / (uint64_t)get_nex_per_rack());
 }
 
 static bool lid_is_local(uint32_t lid)
 {
 	int owner = lid_owner_rank(lid);
-	int self = get_nex_id()/64 + 1;
+	int self = get_nex_id() / (int)get_nex_per_rack();
 	return owner == self;
 }
 
@@ -323,7 +396,7 @@ static int open_remote_ring_wait(const char* name, uint64_t bytes, struct shm_ri
   while (1) {
     fd = shm_open(name, O_RDWR | O_CLOEXEC, 0);
     if (fd >= 0) break;
-    yield();
+    nex_fiber_idle_yield();
   }
 
   uint64_t sz = pow2_u64(bytes);
@@ -337,7 +410,7 @@ static int open_remote_ring_wait(const char* name, uint64_t bytes, struct shm_ri
       close(fd); 
       return e; 
     }
-    yield();
+    nex_fiber_idle_yield();
   }while(st.st_size != map_len);
 
   void* p = mmap(NULL, (size_t)map_len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
@@ -354,13 +427,13 @@ static int open_remote_ring_wait(const char* name, uint64_t bytes, struct shm_ri
   while (true) {
     uint64_t s = __atomic_load_n(&h->size, __ATOMIC_ACQUIRE);
     if (s==sz) break;
-    yield();
+    nex_fiber_idle_yield();
   }
   while (true) {
     uint64_t gen = __atomic_load_n(&h->generation, __ATOMIC_ACQUIRE);
     if (gen != 0 && gen != SHM_RING_GENERATION_INVALID)
       break;
-    yield();
+    nex_fiber_idle_yield();
   }
 
   out->h = h;
@@ -502,7 +575,7 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
         return -1;
       }
       // pthread_mutex_unlock(&h->lock);
-      yield();
+      nex_fiber_idle_yield();
       continue;
     }
 
@@ -527,7 +600,7 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
   }
 
   if (apply_perf_model) {
-    accvm_syms.wait_for_completion(slot);
+    nex_wait_for_completion((uint32_t)slot);
   }
 
   return (ssize_t)done; // == len
@@ -567,7 +640,7 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model)
       iter++;
       NEX_TRACE("nex_shm_write waiting for free space (iter=%d)", iter);
       // pthread_mutex_unlock(&h->lock);
-      yield();
+      nex_fiber_idle_yield();
 
       continue;
     }
@@ -593,7 +666,7 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model)
   }
 
   if(apply_perf_model){
-    accvm_syms.wait_for_completion(slot);
+    nex_wait_for_completion((uint32_t)slot);
   }
   
   return (ssize_t)done; // == len
@@ -705,7 +778,7 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
     if (slot_out) *slot_out = slot;
     
     // has to wait here, otherwise, the application can read data directly before the perf model says its ready
-    accvm_syms.wait_for_completion(slot);
+    nex_wait_for_completion((uint32_t)slot);
 
   }
 
@@ -730,7 +803,7 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
         return -1;
       }
       NEX_TRACE("nex_shm_readv waiting for data (iter=%d)", iter++);
-      yield();
+      nex_fiber_idle_yield();
       continue;
     }
 
@@ -841,7 +914,7 @@ ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
         return -1;
       }
       NEX_TRACE("nex_shm_writev waiting for free space (iter=%d)", iter++);
-      yield();
+      nex_fiber_idle_yield();
       continue;
     }
 

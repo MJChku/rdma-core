@@ -64,7 +64,8 @@ struct nex_pending_read {
 	struct nex_pending_read *next;
 };
 
-struct nex_tx_entry;
+struct nex_send_task;
+struct nex_tx_wait_entry;
 
 struct nex_qp {
 	struct verbs_qp vqp;
@@ -80,44 +81,40 @@ struct nex_qp {
 	int tx_fd;
 	int rx_fd;
 	bool rx_running;
-	pthread_t rx_thread;
 	uint32_t remote_qp_num;
 	uint32_t remote_lid;
 	bool sq_sig_all;
-	pthread_spinlock_t send_lock;
 	uint8_t *send_buf;
 	size_t send_buf_capacity;
 	pthread_spinlock_t rdma_lock;
 	struct nex_pending_read *pending_reads;
 	pthread_mutex_t state_lock;
 	pthread_cond_t state_cond;
+	bool destroying;
 	bool connect_in_progress;
 	int connect_status;
-	bool connect_thread_valid;
+	bool rx_worker_done;
+	bool tx_sender_done;
+	bool tx_worker_done;
 	
 	struct nex_pending_msg *pending_head;
 	struct nex_pending_msg *pending_tail;
-	pthread_spinlock_t pending_lock;
 
-	pthread_t connect_thread;
+	// Cross-thread send task handoff (post_send -> tx fiber)
+	struct nex_send_task **send_task_queue;
+	uint32_t send_task_qsize;
+	uint32_t send_task_head;
+	uint32_t send_task_tail;
+	pthread_spinlock_t send_task_lock;
 
-	// Async TX completion support
-	struct nex_tx_entry *tx_queue;
-	uint32_t tx_qsize;
-	uint32_t tx_head;
-	uint32_t tx_tail;
-	pthread_spinlock_t tx_lock;
-	bool tx_running;
-	pthread_t tx_thread;
+	// TX completion handoff (tx send fiber -> tx wait fiber)
+	struct nex_tx_wait_entry *tx_wait_queue;
+	uint32_t tx_wait_qsize;
+	uint32_t tx_wait_head;
+	uint32_t tx_wait_tail;
+
+	atomic_bool tx_running;
 	uint32_t next_tag;
-};
-
-struct nex_tx_entry {
-	uint64_t wr_id;
-	enum ibv_wc_opcode wc_op;
-	uint32_t byte_len;
-	int slot;
-	bool signaled;
 };
 
 struct nex_mr {

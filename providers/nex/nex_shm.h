@@ -7,7 +7,7 @@
 
 typedef void (*compressT_t)(float percentage);
 typedef void (*jailbreakT_t)(float percentage);
-typedef void (*end_jailbreakT_t)(void);
+typedef void (*end_jailbreakT_t)(float percentage);
 typedef int (*send_data_qp_t)(uint32_t src_addr, uint32_t dst_addr, size_t len,
                               uint32_t src_qp, uint32_t dst_qp, uint32_t tag,
                               bool wait_required);
@@ -15,6 +15,12 @@ typedef int (*recv_data_qp_t)(uint32_t src_addr, uint32_t dst_addr, size_t len,
                               uint32_t src_qp, uint32_t dst_qp, uint32_t tag,
                               bool wait_required);
 typedef void (*wait_for_completion_t)(uint32_t slot);
+typedef void (*nex_fiber_fn_t)(void *arg);
+typedef int (*nex_sched_init_t)(uint32_t nex_id);
+typedef int (*nex_sched_new_fiber_t)(nex_fiber_fn_t fn, void *arg);
+typedef void (*nex_sched_shutdown_t)(void);
+typedef void (*nex_fiber_yield_t)(void);
+typedef void (*nex_fiber_idle_yield_t)(void);
 typedef void (*changeEpoch_t)(int epoch_duration_ns, int cnt);
 typedef void (*compressTAndChangeEpoch_t)(float percentage, uint64_t epoch_dur, int cnt);
 
@@ -26,6 +32,11 @@ struct accvm_symbols {
     send_data_qp_t send_data_qp;
     recv_data_qp_t recv_data_qp;
     wait_for_completion_t wait_for_completion;
+    nex_sched_init_t nex_sched_init;
+    nex_sched_new_fiber_t nex_sched_new_fiber;
+    nex_sched_shutdown_t nex_sched_shutdown;
+    nex_fiber_yield_t nex_fiber_yield;
+    nex_fiber_idle_yield_t nex_fiber_idle_yield;
     compressTAndChangeEpoch_t compressTAndChangeEpoch;
 };
 
@@ -41,6 +52,9 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
 int nex_shm_close(int fd);
 int nex_shm_shutdown(int fd);
 void nex_fast_memcpy(void* dst, const void* src, size_t len);
+void nex_fiber_yield(void);
+void nex_fiber_idle_yield(void);
+void nex_wait_for_completion(uint32_t slot);
 int get_accvm_symbols(struct accvm_symbols* syms);
 
 extern struct accvm_symbols accvm_syms;
