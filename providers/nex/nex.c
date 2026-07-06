@@ -42,7 +42,7 @@ static bool nex_use_tcp_backend(void)
 	static bool use_tcp = false;
 
 	if (!initialized) {
-		const char *backend = getenv("NEX_IO_BACKEND");
+		const char *backend = getenv("GX_IO_BACKEND");
 		if (backend && strcmp(backend, "tcp") == 0) {
 			use_tcp = true;
 		}
@@ -78,29 +78,6 @@ static uint64_t now_ns(void)
 #ifndef IBV_LINK_SPEED_EDR
 #define IBV_LINK_SPEED_EDR 8
 #endif
-
-#define EPOCH_DUR 100
-#define EPOCH_PAIR EPOCH_DUR, 4
-#define EPOCH_PAIR_SHORT EPOCH_DUR, 4
-
-// #define SMALL_SIZE_BENCHMARK
-inline void change_epoch(int epoch_dur, int cnt){
-	#ifdef SMALL_SIZE_BENCHMARK
-	accvm_syms.compressTAndChangeEpoch(200.0f, epoch_dur, cnt);
-	#endif
-}
-
-inline void enter_ib_emu(int epoch_dur, int cnt){
-	#ifdef SMALL_SIZE_BENCHMARK
-	accvm_syms.compressT(200.0f);
-	#endif
-}
-
-inline void leave_ib_emu(void){
-	#ifdef SMALL_SIZE_BENCHMARK
-	accvm_syms.compressT(1.0f);
-	#endif
-}
 
 /* Utility helpers ------------------------------------------------------- */
 
@@ -160,7 +137,7 @@ static int get_nex_id(void){
 	
 	if(__atomic_load_n(&initialized, __ATOMIC_ACQUIRE)) return nex_id;
 	//get env NEX_ID
-	const char* env_p = getenv("NEX_ID");
+	const char* env_p = getenv("GX_ID");
 	if(env_p == NULL){
 		return nex_id;
 	}
@@ -346,7 +323,6 @@ static int nex_cq_pop(struct nex_cq *cq, int num_entries, struct ibv_wc *wc)
 	if(cq->head == cq->tail) {
 		return 0;
 	}
-	enter_ib_emu(EPOCH_PAIR_SHORT);
 	pthread_spin_lock(&cq->lock);
 	while (produced < num_entries && cq->head != cq->tail) {
 		wc[produced++] = cq->entries[cq->head];
@@ -357,7 +333,6 @@ static int nex_cq_pop(struct nex_cq *cq, int num_entries, struct ibv_wc *wc)
 		//all done
 		NEX_TRACE("nex_cq_pop produced=%d/%d", produced, num_entries);
 	}
-	leave_ib_emu();
 	return produced;
 }
 
@@ -708,8 +683,6 @@ static void fiber_tx_worker(void *arg)
 	for (;;) {
 		struct nex_tx_wait_entry entry;
 		if (fiber_txq_try_pop(qp, &entry)) {
-			if (entry.slot >= 0)
-				nex_wait_for_completion((uint32_t)entry.slot);
 			struct ibv_wc wc = {
 				.wr_id = entry.wr_id,
 				.status = IBV_WC_SUCCESS,
@@ -1428,7 +1401,6 @@ static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 {
 	struct nex_qp *qp = to_nqp(ibqp);
 
-	enter_ib_emu(EPOCH_PAIR);
 	// iterate through work requests (wr)
 	// wr has next and sg_list (scatter-gather list)
 	// each sg_list has addr, length, lkey
@@ -1470,7 +1442,6 @@ static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 			sched_yield();
 		}
 	}
-	leave_ib_emu();
 	return 0;
 }
 
@@ -1478,7 +1449,6 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			 struct ibv_send_wr **bad_wr)
 {
 
-	enter_ib_emu(EPOCH_PAIR);
 	
 
 	struct nex_qp *qp = to_nqp(ibqp);
@@ -1650,20 +1620,16 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			qp->vqp.qp.qp_num, qp->remote_qp_num);
 	}
 
-	leave_ib_emu();
 	return 0;
 
 ERROR_OUT:
-	leave_ib_emu();
 	return errno;
 }
 
 static void fiber_rx_worker(void *arg)
 {
 	
-	// enter_ib_emu(EPOCH_PAIR);
-	// accvm_syms.jailbreakT(2000.0f);
-
+	//
 	struct nex_qp *qp = arg;
 	uint8_t *payload_buf = NULL;
 	size_t payload_capacity = 0;
@@ -1694,7 +1660,6 @@ static void fiber_rx_worker(void *arg)
 			if (fiber_read_full(qp->rx_fd, &hdr, sizeof(hdr), 0))  // header: no perf model
 				break;
 
-			// change_epoch(EPOCH_PAIR);
 			
 			// NEX_TRACE("rx header, no perf, wr_id=%" PRIu64 " opcode=%u len=%u status=%u hdr.length=%u qp_pair=%u:%u",
 			// 	   hdr.wr_id, hdr.opcode, hdr.length, hdr.status, hdr.length,
@@ -1974,7 +1939,6 @@ static void fiber_rx_worker(void *arg)
 					// 	int sched_cnt = delay_ns / quantum_ns;
 					// 	NEX_TRACE("rdma_read_resp modeling delay for hdr.length=%u, delay_ns=%d, dur_ns=%d",
 					// 				hdr.length, delay_ns, dur_ns);
-					// 	change_epoch(quantum_ns, sched_cnt);
 					// 	for(int i=0; i<sched_cnt; i++){
 					// 		sched_yield();
 					// 	}
@@ -2290,7 +2254,7 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
     ctx->qp_limit = NEX_DEFAULT_MAX_QP;
     pthread_spin_init(&ctx->mr_lock, PTHREAD_PROCESS_PRIVATE);
     ctx->mr_list = NULL;
-    const char *env_limit = getenv("NEX_MAX_QP");
+    const char *env_limit = getenv("GX_MAX_QP");
     if (env_limit && *env_limit) {
         long v = strtol(env_limit, NULL, 10);
         if (v > 0 && v < INT32_MAX)

@@ -13,7 +13,7 @@ add_custom_target(nex DEPENDS "nex-rdmav${IBVERBS_PABI_VERSION}")
 rdma_test_executable(test_nex test_nex.c)
 target_link_libraries(test_nex LINK_PRIVATE ibverbs)
 
-add_executable(nex_cm_srv
+add_executable(gx_cm_srv
   cm/nex_cm_srv.c
   cm/nex_cm.c)
-set_target_properties(nex_cm_srv PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${BUILD_BIN}")
+set_target_properties(gx_cm_srv PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${BUILD_BIN}")

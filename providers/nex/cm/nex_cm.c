@@ -15,7 +15,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define NEX_CM_DEFAULT_SERVICE_HOST "nex-mpi-0"
+#define NEX_CM_DEFAULT_SERVICE_HOST "gx-mpi-0"
 #define NEX_CM_DEFAULT_SERVICE_PORT "5690"
 #define NEX_CM_TARGET_NOFILE 131072
 
@@ -40,7 +40,7 @@ static int cm_debug_enabled(void)
 	static int initialized = 0;
 	static int enabled = 0;
 	if (!initialized) {
-		const char *v = getenv("NEX_CM_DEBUG");
+		const char *v = getenv("GX_CM_DEBUG");
 		enabled = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
 		initialized = 1;
 	}
@@ -196,8 +196,8 @@ int nex_cm_exchange(const char *service_id,
 {
 	nex_raise_nofile_best_effort();
 
-	const char *cm_host = getenv("NEX_CM_SERVICE_HOST");
-	const char *cm_port = getenv("NEX_CM_SERVICE_PORT");
+	const char *cm_host = getenv("GX_CM_SERVICE_HOST");
+	const char *cm_port = getenv("GX_CM_SERVICE_PORT");
 	if (!cm_host || !*cm_host)
 		cm_host = NEX_CM_DEFAULT_SERVICE_HOST;
 	if (!cm_port || !*cm_port)

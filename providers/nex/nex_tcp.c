@@ -462,17 +462,10 @@ ssize_t nex_tcp_read(int fd, void *buf, size_t len, int apply_perf_model)
     if (len == 0)
         return 0;
 
-    int slot = -1;
-    if (apply_perf_model) {
-        slot = accvm_syms.recv_data_qp(c->remote_lid, c->local_lid, len,
-                                       c->remote_qp, c->local_qp, 0u, true);
-    }
+    (void)apply_perf_model;
 
     if (read_all_sock(c->sock_fd, buf, len) != 0)
         return -1;
-
-    if (apply_perf_model && slot >= 0)
-        nex_wait_for_completion((uint32_t)slot);
 
     return (ssize_t)len;
 }
@@ -487,17 +480,10 @@ ssize_t nex_tcp_write(int fd, const void *buf, size_t len, int apply_perf_model)
     if (len == 0)
         return 0;
 
-    int slot = -1;
-    if (apply_perf_model) {
-        slot = accvm_syms.send_data_qp(c->local_lid, c->remote_lid, len,
-                                       c->local_qp, c->remote_qp, 0u, true);
-    }
+    (void)apply_perf_model;
 
     if (write_all_sock(c->sock_fd, buf, len) != 0)
         return -1;
-
-    if (apply_perf_model && slot >= 0)
-        nex_wait_for_completion((uint32_t)slot);
 
     return (ssize_t)len;
 }
@@ -528,21 +514,14 @@ ssize_t nex_tcp_writev(int fd, const struct iovec *iov, int iovcnt,
         return -1;
     }
 
-    int slot = -1;
+    (void)apply_perf_model;
+    (void)wait_completion;
+    (void)tag;
     if (slot_out)
         *slot_out = -1;
-    if (apply_perf_model) {
-        slot = accvm_syms.send_data_qp(c->local_lid, c->remote_lid, total_len,
-                                       c->local_qp, c->remote_qp, tag, wait_completion);
-        if (slot_out)
-            *slot_out = slot;
-    }
 
     if (writev_all_sock(c->sock_fd, iov, iovcnt, total_len) != 0)
         return -1;
-
-    if (apply_perf_model && slot >= 0 && (wait_completion || !slot_out))
-        nex_wait_for_completion((uint32_t)slot);
 
     return (ssize_t)total_len;
 }
@@ -573,21 +552,14 @@ ssize_t nex_tcp_readv(int fd, const struct iovec *iov, int iovcnt,
         return -1;
     }
 
-    int slot = -1;
+    (void)apply_perf_model;
+    (void)wait_completion;
+    (void)tag;
     if (slot_out)
         *slot_out = -1;
-    if (apply_perf_model) {
-        slot = accvm_syms.recv_data_qp(c->remote_lid, c->local_lid, total_len,
-                                       c->remote_qp, c->local_qp, tag, wait_completion);
-        if (slot_out)
-            *slot_out = slot;
-    }
 
     if (readv_all_sock(c->sock_fd, iov, iovcnt, total_len) != 0)
         return -1;
-
-    if (apply_perf_model && slot >= 0 && (wait_completion || !slot_out))
-        nex_wait_for_completion((uint32_t)slot);
 
     return (ssize_t)total_len;
 }

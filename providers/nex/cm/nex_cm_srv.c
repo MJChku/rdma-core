@@ -196,7 +196,7 @@ static void serve(int listen_fd)
 		uint16_t port = ntohs(req.listen_port);
 		uint32_t local_lid = 0, remote_lid = 0, local_qpn = 0, remote_qpn = 0;
 		if (parse_service_id(req.service_id, &local_lid, &remote_lid, &local_qpn, &remote_qpn) != 0) {
-			fprintf(stderr, "ERROR: nex_cm_srv: invalid service_id format '%s'\n", req.service_id);
+			fprintf(stderr, "ERROR: gx_cm_srv: invalid service_id format '%s'\n", req.service_id);
 			close(fd);
 			continue;
 		}
@@ -269,7 +269,7 @@ int main(void)
 		close(listen_fd);
 		return 1;
 	}
-	printf("nex_cm_srv listening on port %d (backlog=%d)\n",
+	printf("gx_cm_srv listening on port %d (backlog=%d)\n",
 	       CM_LISTEN_PORT, CM_LISTEN_BACKLOG);
 	serve(listen_fd);
 	close(listen_fd);

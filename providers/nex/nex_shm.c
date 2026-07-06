@@ -71,54 +71,6 @@ int get_accvm_symbols(struct accvm_symbols* syms) {
     void* handle = get_accvm_lib();
     if (!handle) return -1;
 
-    syms->compressT = (compressT_t)dlsym(handle, "compressT");
-    if (!syms->compressT) {
-        NEX_ERROR("getting compressT: %s\n", dlerror());
-        return -1;
-    }
-
-    syms->compressTAndChangeEpoch = (compressTAndChangeEpoch_t)dlsym(handle, "compressTAndChangeEpoch");
-    if (!syms->compressTAndChangeEpoch) {
-        NEX_ERROR("getting compressTAndChangeEpoch: %s\n", dlerror());
-        return -1;
-    }
-
-    syms->jailbreakT = (jailbreakT_t)dlsym(handle, "jailbreakT");
-    if (!syms->jailbreakT) {
-        NEX_ERROR("getting jailbreakT: %s\n", dlerror());
-        return -1;
-    }
-
-    syms->endJailbreakT = (end_jailbreakT_t)dlsym(handle, "endJailbreakT");
-    if (!syms->endJailbreakT) {
-        NEX_ERROR("getting endJailbreakT: %s\n", dlerror());
-        return -1;
-    }
-
-    syms->changeEpoch = (changeEpoch_t)dlsym(handle, "changeEpoch");
-    if (!syms->changeEpoch) {
-        NEX_ERROR("getting changeEpoch: %s\n", dlerror());
-        return -1;
-    }
-
-    syms->send_data_qp = (send_data_qp_t)dlsym(handle, "send_data_qp");
-    if (!syms->send_data_qp) {
-        NEX_ERROR("getting send_data_qp: %s\n", dlerror());
-        return -1;
-    }
-
-    syms->recv_data_qp = (recv_data_qp_t)dlsym(handle, "recv_data_qp");
-    if (!syms->recv_data_qp) {
-        NEX_ERROR("getting recv_data_qp: %s\n", dlerror());
-        return -1;
-    }
-
-    syms->wait_for_completion = (wait_for_completion_t)dlsym(handle, "wait_for_completion");
-    if (!syms->wait_for_completion) {
-        NEX_ERROR("getting wait_for_completion: %s\n", dlerror());
-        return -1;
-    }
-
     syms->nex_sched_init = (nex_sched_init_t)dlsym(handle, "nex_sched_init");
     if (!syms->nex_sched_init) {
         NEX_ERROR("getting nex_sched_init: %s\n", dlerror());
@@ -162,11 +114,6 @@ inline void nex_fiber_idle_yield(void)
   accvm_syms.nex_fiber_idle_yield();
 }
 
-inline void nex_wait_for_completion(uint32_t slot)
-{
-  accvm_syms.wait_for_completion(slot);
-}
-
 void nex_fast_memcpy(void* dst, const void* src, size_t len) {
   // 6byte per nano second
   // 64byte 10 nano second
@@ -186,7 +133,7 @@ static int get_nex_id(void){
 	
 	if(__atomic_load_n(&initialized, __ATOMIC_ACQUIRE)) return nex_id;
 	//get env NEX_ID
-	const char* env_p = getenv("NEX_ID");
+	const char* env_p = getenv("GX_ID");
 	if(env_p == NULL){
 		return nex_id;
 	}
@@ -207,7 +154,7 @@ static uint32_t get_nex_per_rack(void)
 	if (__atomic_load_n(&initialized, __ATOMIC_ACQUIRE))
 		return per_rack;
 
-	const char *env_p = getenv("NEX_PER_RACK");
+	const char *env_p = getenv("GX_PER_RACK");
 	if (env_p && *env_p) {
 		errno = 0;
 		char *endp = NULL;
@@ -543,18 +490,11 @@ int nex_shm_dial(const char* service_id, int* fd_out) {
 
 
 ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
-  apply_perf_model = 0; // --- IGNORE ---
-  int slot = 0;
- 
+  (void)apply_perf_model;
 
   struct nex_shm_conn* c = conn_get(fd);
   if (!c) { errno = EBADF; return -1; }
   if (len == 0) return 0;
-
-  if(apply_perf_model){
-    slot = accvm_syms.recv_data_qp(c->remote_lid, c->local_lid, len,
-                                   c->remote_qp, c->local_qp, 0u, true);
-  }
 
   struct shm_ring_hdr* h = c->rx.h;
   size_t done = 0;
@@ -599,27 +539,18 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
     done += to_read;
   }
 
-  if (apply_perf_model) {
-    nex_wait_for_completion((uint32_t)slot);
-  }
-
   return (ssize_t)done; // == len
 }
 
 /* Block until exactly len bytes are written, or error. Returns len on success, -1 on error (errno set). */
 ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model) {
   
-  apply_perf_model = 0; // --- IGNORE ---
+  (void)apply_perf_model;
   struct nex_shm_conn* c = conn_get(fd);
   if (!c) { errno = EBADF; return -1; }
   if (len == 0) return 0;
 
   struct shm_ring_hdr* h = c->tx.h;
-  int slot = 0;
-  if(apply_perf_model){
-    slot = accvm_syms.send_data_qp(c->local_lid, c->remote_lid, len,
-                                   c->local_qp, c->remote_qp, 0u, true);
-  }
   size_t done = 0;
   int iter = 0;
   while (done < len) {
@@ -665,10 +596,6 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model)
     done += to_write;
   }
 
-  if(apply_perf_model){
-    nex_wait_for_completion((uint32_t)slot);
-  }
-  
   return (ssize_t)done; // == len
 }
 
@@ -762,25 +689,14 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
     total_len += iov[i].iov_len;
   }
 
-  if (wait_completion) {
-    assert(apply_perf_model);
-    assert(slot_out != NULL);
-  }
+  (void)apply_perf_model;
+  (void)wait_completion;
+  (void)tag;
+  if (slot_out) *slot_out = -1;
   if (total_len == 0) return 0;
 
   struct nex_shm_conn* c = conn_get(fd);
   if (!c) { errno = EBADF; return -1; }
-
-  int slot = -1;
-  if (apply_perf_model) {
-    slot = accvm_syms.recv_data_qp(c->remote_lid, c->local_lid, total_len,
-                                   c->remote_qp, c->local_qp, tag, wait_completion);
-    if (slot_out) *slot_out = slot;
-    
-    // has to wait here, otherwise, the application can read data directly before the perf model says its ready
-    nex_wait_for_completion((uint32_t)slot);
-
-  }
 
   struct shm_ring_hdr* h = c->rx.h;
   size_t done = 0;
@@ -858,13 +774,10 @@ ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
     return -1;
   }
 
-  if(wait_completion){
-    assert(apply_perf_model);
-    assert(slot_out != NULL);
-  }
+  (void)apply_perf_model;
+  (void)wait_completion;
+  (void)tag;
 
-  // apply_perf_model = 0; // --- IGNORE ---
-  
   size_t total_len = 0;
   for (int i = 0; i < iovcnt; ++i) {
     if (SIZE_MAX - total_len < iov[i].iov_len) {
@@ -876,20 +789,11 @@ ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
 
   if (total_len == 0)
     return 0;
-  int slot = -1;
 
   struct nex_shm_conn* c = conn_get(fd);
   if (!c) { errno = EBADF; return -1; }
   if (slot_out)
       *slot_out = -1;
-
-  if(apply_perf_model){
-    slot = accvm_syms.send_data_qp(c->local_lid, c->remote_lid, total_len,
-                                   c->local_qp, c->remote_qp, tag, wait_completion);
-    // NEX_INFO("nex_shm_writev apply_perf_model slot=%d", slot);
-    if (slot_out)
-        *slot_out = slot;
-  }
 
   struct shm_ring_hdr* h = c->tx.h;
 
