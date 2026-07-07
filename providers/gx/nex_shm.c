@@ -71,47 +71,47 @@ int get_accvm_symbols(struct accvm_symbols* syms) {
     void* handle = get_accvm_lib();
     if (!handle) return -1;
 
-    syms->nex_sched_init = (nex_sched_init_t)dlsym(handle, "nex_sched_init");
-    if (!syms->nex_sched_init) {
-        NEX_ERROR("getting nex_sched_init: %s\n", dlerror());
+    syms->gx_sched_init = (gx_sched_init_t)dlsym(handle, "gx_sched_init");
+    if (!syms->gx_sched_init) {
+        NEX_ERROR("getting gx_sched_init: %s\n", dlerror());
         return -1;
     }
 
-    syms->nex_sched_new_fiber = (nex_sched_new_fiber_t)dlsym(handle, "nex_sched_new_fiber");
-    if (!syms->nex_sched_new_fiber) {
-        NEX_ERROR("getting nex_sched_new_fiber: %s\n", dlerror());
+    syms->gx_sched_new_fiber = (gx_sched_new_fiber_t)dlsym(handle, "gx_sched_new_fiber");
+    if (!syms->gx_sched_new_fiber) {
+        NEX_ERROR("getting gx_sched_new_fiber: %s\n", dlerror());
         return -1;
     }
 
-    syms->nex_sched_shutdown = (nex_sched_shutdown_t)dlsym(handle, "nex_sched_shutdown");
-    if (!syms->nex_sched_shutdown) {
-        NEX_ERROR("getting nex_sched_shutdown: %s\n", dlerror());
+    syms->gx_sched_shutdown = (gx_sched_shutdown_t)dlsym(handle, "gx_sched_shutdown");
+    if (!syms->gx_sched_shutdown) {
+        NEX_ERROR("getting gx_sched_shutdown: %s\n", dlerror());
         return -1;
     }
 
-    syms->nex_fiber_yield = (nex_fiber_yield_t)dlsym(handle, "nex_fiber_yield");
-    if (!syms->nex_fiber_yield) {
-        NEX_ERROR("getting nex_fiber_yield: %s\n", dlerror());
+    syms->gx_fiber_yield = (gx_fiber_yield_t)dlsym(handle, "gx_fiber_yield");
+    if (!syms->gx_fiber_yield) {
+        NEX_ERROR("getting gx_fiber_yield: %s\n", dlerror());
         return -1;
     }
 
-    syms->nex_fiber_idle_yield = (nex_fiber_idle_yield_t)dlsym(handle, "nex_fiber_idle_yield");
-    if (!syms->nex_fiber_idle_yield) {
-        NEX_ERROR("getting nex_fiber_idle_yield: %s\n", dlerror());
+    syms->gx_fiber_idle_yield = (gx_fiber_idle_yield_t)dlsym(handle, "gx_fiber_idle_yield");
+    if (!syms->gx_fiber_idle_yield) {
+        NEX_ERROR("getting gx_fiber_idle_yield: %s\n", dlerror());
         return -1;
     }
 
     return 0;
 }
 
-inline void nex_fiber_yield(void)
+inline void gx_fiber_yield(void)
 {
-  accvm_syms.nex_fiber_yield();
+  accvm_syms.gx_fiber_yield();
 }
 
-inline void nex_fiber_idle_yield(void)
+inline void gx_fiber_idle_yield(void)
 {
-  accvm_syms.nex_fiber_idle_yield();
+  accvm_syms.gx_fiber_idle_yield();
 }
 
 void nex_fast_memcpy(void* dst, const void* src, size_t len) {
@@ -343,7 +343,7 @@ static int open_remote_ring_wait(const char* name, uint64_t bytes, struct shm_ri
   while (1) {
     fd = shm_open(name, O_RDWR | O_CLOEXEC, 0);
     if (fd >= 0) break;
-    nex_fiber_idle_yield();
+    gx_fiber_idle_yield();
   }
 
   uint64_t sz = pow2_u64(bytes);
@@ -357,7 +357,7 @@ static int open_remote_ring_wait(const char* name, uint64_t bytes, struct shm_ri
       close(fd); 
       return e; 
     }
-    nex_fiber_idle_yield();
+    gx_fiber_idle_yield();
   }while(st.st_size != map_len);
 
   void* p = mmap(NULL, (size_t)map_len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
@@ -374,13 +374,13 @@ static int open_remote_ring_wait(const char* name, uint64_t bytes, struct shm_ri
   while (true) {
     uint64_t s = __atomic_load_n(&h->size, __ATOMIC_ACQUIRE);
     if (s==sz) break;
-    nex_fiber_idle_yield();
+    gx_fiber_idle_yield();
   }
   while (true) {
     uint64_t gen = __atomic_load_n(&h->generation, __ATOMIC_ACQUIRE);
     if (gen != 0 && gen != SHM_RING_GENERATION_INVALID)
       break;
-    nex_fiber_idle_yield();
+    gx_fiber_idle_yield();
   }
 
   out->h = h;
@@ -515,7 +515,7 @@ ssize_t nex_shm_read(int fd, void* buf, size_t len, int apply_perf_model) {
         return -1;
       }
       // pthread_mutex_unlock(&h->lock);
-      nex_fiber_idle_yield();
+      gx_fiber_idle_yield();
       continue;
     }
 
@@ -571,7 +571,7 @@ ssize_t nex_shm_write(int fd, const void* buf, size_t len, int apply_perf_model)
       iter++;
       NEX_TRACE("nex_shm_write waiting for free space (iter=%d)", iter);
       // pthread_mutex_unlock(&h->lock);
-      nex_fiber_idle_yield();
+      gx_fiber_idle_yield();
 
       continue;
     }
@@ -719,7 +719,7 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
         return -1;
       }
       NEX_TRACE("nex_shm_readv waiting for data (iter=%d)", iter++);
-      nex_fiber_idle_yield();
+      gx_fiber_idle_yield();
       continue;
     }
 
@@ -818,7 +818,7 @@ ssize_t nex_shm_writev(int fd, const struct iovec *iov, int iovcnt,
         return -1;
       }
       NEX_TRACE("nex_shm_writev waiting for free space (iter=%d)", iter++);
-      nex_fiber_idle_yield();
+      gx_fiber_idle_yield();
       continue;
     }
 

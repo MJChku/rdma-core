@@ -153,13 +153,13 @@ static int get_nex_id(void){
 static pthread_mutex_t g_sched_ref_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned g_sched_refcount = 0;
 
-static int nex_sched_acquire(void)
+static int gx_sched_acquire(void)
 {
 	int rc = 0;
 
 	pthread_mutex_lock(&g_sched_ref_lock);
 	if (g_sched_refcount == 0) {
-		rc = accvm_syms.nex_sched_init((uint32_t)get_nex_id());
+		rc = accvm_syms.gx_sched_init((uint32_t)get_nex_id());
 		if (rc != 0) {
 			pthread_mutex_unlock(&g_sched_ref_lock);
 			return rc;
@@ -170,13 +170,13 @@ static int nex_sched_acquire(void)
 	return 0;
 }
 
-static void nex_sched_release(void)
+static void gx_sched_release(void)
 {
 	pthread_mutex_lock(&g_sched_ref_lock);
 	if (g_sched_refcount > 0) {
 		--g_sched_refcount;
 		if (g_sched_refcount == 0)
-			accvm_syms.nex_sched_shutdown();
+			accvm_syms.gx_sched_shutdown();
 	}
 	pthread_mutex_unlock(&g_sched_ref_lock);
 }
@@ -188,7 +188,7 @@ static inline void fiber_pthread_spin_lock(pthread_spinlock_t *lock)
 		if (rc == 0)
 			return;
 		assert(rc == EBUSY);
-		nex_fiber_yield();
+		gx_fiber_yield();
 	}
 }
 
@@ -564,7 +564,7 @@ static void fiber_txq_push(struct nex_qp *qp, const struct nex_tx_wait_entry *en
 			qp->tx_wait_tail = next;
 			return;
 		}
-		nex_fiber_idle_yield();
+		gx_fiber_idle_yield();
 	}
 }
 
@@ -628,7 +628,7 @@ static void fiber_tx_send_worker(void *arg)
 			// 		now = now_ns();
 			// 		rate = 20.0 / (now - last_consume_time);
 			// 		if(rate > 0.005){
-			// 			nex_fiber_idle_yield();
+			// 			gx_fiber_idle_yield();
 			// 		}else{
 			// 			break;
 			// 		}
@@ -660,14 +660,14 @@ static void fiber_tx_send_worker(void *arg)
 			}
 			free(task->payload_iov);
 			free(task);
-			nex_fiber_yield();
+			gx_fiber_yield();
 			continue;
 		}
 
 		bool running = atomic_load_explicit(&qp->tx_running, memory_order_acquire);
 		if (!running)
 			break;
-		nex_fiber_idle_yield();
+		gx_fiber_idle_yield();
 	}
 
 	pthread_mutex_lock(&qp->state_lock);
@@ -694,7 +694,7 @@ static void fiber_tx_worker(void *arg)
 				fiber_cq_push(qp->send_cq, &wc);
 			NEX_TRACE("nex_tx_worker completed wr_id=%" PRIu64 " opcode=%u len=%u",
 				(uint64_t)wc.wr_id, wc.opcode, wc.byte_len);
-			nex_fiber_yield();
+			gx_fiber_yield();
 			continue;
 		}
 
@@ -706,7 +706,7 @@ static void fiber_tx_worker(void *arg)
 			if (sender_done)
 				break;
 		}
-		nex_fiber_idle_yield();
+		gx_fiber_idle_yield();
 	}
 
 	pthread_mutex_lock(&qp->state_lock);
@@ -735,15 +735,15 @@ static int fiber_start_qp_workers(struct nex_qp *qp)
 
 	atomic_store_explicit(&qp->tx_running, true, memory_order_release);
 
-	rc = accvm_syms.nex_sched_new_fiber(fiber_rx_worker, qp);
+	rc = accvm_syms.gx_sched_new_fiber(fiber_rx_worker, qp);
 	if (rc != 0)
 		goto spawn_rx_fail;
 
-	rc = accvm_syms.nex_sched_new_fiber(fiber_tx_worker, qp);
+	rc = accvm_syms.gx_sched_new_fiber(fiber_tx_worker, qp);
 	if (rc != 0)
 		goto spawn_tx_wait_fail;
 
-	rc = accvm_syms.nex_sched_new_fiber(fiber_tx_send_worker, qp);
+	rc = accvm_syms.gx_sched_new_fiber(fiber_tx_send_worker, qp);
 	if (rc != 0)
 		goto spawn_tx_send_fail;
 
@@ -1354,7 +1354,7 @@ static int nex_qp_start_connect(struct nex_qp *qp)
 	qp->connect_status = EINPROGRESS;
 	pthread_mutex_unlock(&qp->state_lock);
 
-	int rc = accvm_syms.nex_sched_new_fiber(fiber_connect_qp, qp);
+	int rc = accvm_syms.gx_sched_new_fiber(fiber_connect_qp, qp);
 	if (rc) {
 		pthread_mutex_lock(&qp->state_lock);
 		qp->connect_in_progress = false;
@@ -1970,7 +1970,7 @@ static void fiber_rx_worker(void *arg)
 		if (should_exit)
 			break;
 	
-		nex_fiber_yield();
+		gx_fiber_yield();
 	}
 
 	free(payload_buf);
@@ -2168,7 +2168,7 @@ static void nex_free_context(struct ibv_context *ibctx)
 	ctx->mr_list = NULL;
 	pthread_spin_unlock(&ctx->mr_lock);
 	pthread_spin_destroy(&ctx->mr_lock);
-	nex_sched_release();
+	gx_sched_release();
 	verbs_uninit_context(&ctx->ibv_ctx);
 	free(ctx);
 }
@@ -2199,13 +2199,13 @@ static const struct verbs_context_ops nex_ctx_ops = {
 /* Device matching ------------------------------------------------------- */
 
 static const struct verbs_match_ent hca_table[] = {
-	VERBS_NAME_MATCH("nex", NULL),
+	VERBS_NAME_MATCH("gx", NULL),
 	{},
 };
 
 static bool nex_match_device(struct verbs_sysfs_dev *sysfs_dev)
 {
-	if (!strncmp(sysfs_dev->ibdev_name, "nex", 3)) {
+	if (!strncmp(sysfs_dev->ibdev_name, "gx", 2)) {
 		sysfs_dev->match = &hca_table[0];
 		return true;
 	}
@@ -2224,7 +2224,7 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
     	return NULL;
   	}
 
-	if (nex_sched_acquire() != 0) {
+	if (gx_sched_acquire() != 0) {
 		fprintf(stderr, "Error: failed to initialize ACCVM fiber scheduler\n");
 		return NULL;
 	}
@@ -2233,7 +2233,7 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
 	ctx = verbs_init_and_alloc_context(ibdev, cmd_fd, ctx, ibv_ctx,
 					       RDMA_DRIVER_UNKNOWN);
 	if (!ctx) {
-		nex_sched_release();
+		gx_sched_release();
 		return NULL;
 	}
 
@@ -2242,7 +2242,7 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
 	if (ibv_cmd_get_context(&ctx->ibv_ctx, &cmd, sizeof(cmd), NULL,
 					&resp, sizeof(resp))) {
 		free(ctx);
-		nex_sched_release();
+		gx_sched_release();
 		return NULL;
 	}
 
@@ -2286,7 +2286,7 @@ static struct verbs_device *nex_device_alloc(struct verbs_sysfs_dev *sysfs_dev)
 }
 
 static const struct verbs_device_ops nex_dev_ops = {
-	.name = "nex",
+	.name = "gx",
 	/* Match the kernel uverbs_abi_ver below (currently 1) */
 	.match_min_abi_version = 1,
 	.match_max_abi_version = 1,

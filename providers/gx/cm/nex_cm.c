@@ -58,7 +58,7 @@ static void cm_idle_yield(void)
 	static int initialized = 0;
 	static cm_idle_yield_fn_t fn = NULL;
 	if (!initialized) {
-		fn = (cm_idle_yield_fn_t)dlsym(RTLD_DEFAULT, "nex_fiber_idle_yield");
+		fn = (cm_idle_yield_fn_t)dlsym(RTLD_DEFAULT, "gx_fiber_idle_yield");
 		initialized = 1;
 	}
 	if (fn) {

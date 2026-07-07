@@ -1,0 +1,1 @@
+savedcmd_/home/ubuntu/GX/NEX/src/sims/ib/rdma-core/providers/gx/kernel/gx_kernel.mod := printf '%s\n'   gx_kernel.o | awk '!x[$$0]++ { print("/home/ubuntu/GX/NEX/src/sims/ib/rdma-core/providers/gx/kernel/"$$0) }' > /home/ubuntu/GX/NEX/src/sims/ib/rdma-core/providers/gx/kernel/gx_kernel.mod

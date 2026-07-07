@@ -12,7 +12,7 @@
 #include <linux/numa.h>
 #include <rdma/ib_verbs.h>
 
-#define NEX_NAME "nex0"
+#define NEX_NAME "gx0"
 
 static char *ifname;
 module_param(ifname, charp, 0444);
@@ -253,7 +253,7 @@ static int __init nex_init(void)
 	__be64 node_guid = cpu_to_be64(0x1122334455667788ULL);
 	int ret;
 
-	pr_info("nex: loading minimal RDMA emu device\n");
+	pr_info("gx: loading minimal RDMA emu device\n");
 
 	/* allocate full parent object (siw uses this pattern) */
 	/* sdev = ib_alloc_device(siw_device, base_dev);  — per siw */ /* :contentReference[oaicite:1]{index=1} */
@@ -314,9 +314,9 @@ static int __init nex_init(void)
 	strscpy(ibd->node_desc, "NEX minimal RDMA", sizeof(ibd->node_desc));
 	ibd->node_guid = node_guid;
 
-	ret = ib_register_device(ibd, "nex%d", NULL);
+	ret = ib_register_device(ibd, "gx%d", NULL);
 	if (ret) {
-		pr_err("nex: ib_register_device failed: %d\n", ret);
+		pr_err("gx: ib_register_device failed: %d\n", ret);
 		if (nex->netdev) {
 			ib_device_set_netdev(ibd, NULL, 1);
 			dev_put(nex->netdev);
@@ -328,7 +328,7 @@ static int __init nex_init(void)
 	nex_singleton = nex;
 
 	nex_kernel_loaded = 1;
-	pr_info("nex: registered as %s (if=%s)\n", NEX_NAME, ifname ? ifname : "none");
+	pr_info("gx: registered as %s (if=%s)\n", NEX_NAME, ifname ? ifname : "none");
 	return 0;
 }
 
@@ -339,7 +339,7 @@ static void __exit nex_exit(void)
 	if (!nex)
 		return;
 
-	pr_info("nex: unloading\n");
+	pr_info("gx: unloading\n");
 	ib_unregister_device(&nex->base_dev);
 	if (nex->netdev) {
 		ib_device_set_netdev(&nex->base_dev, NULL, 1);

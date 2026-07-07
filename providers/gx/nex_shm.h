@@ -5,19 +5,19 @@
 #include <sys/uio.h>
 #include <stdbool.h>
 
-typedef void (*nex_fiber_fn_t)(void *arg);
-typedef int (*nex_sched_init_t)(uint32_t nex_id);
-typedef int (*nex_sched_new_fiber_t)(nex_fiber_fn_t fn, void *arg);
-typedef void (*nex_sched_shutdown_t)(void);
-typedef void (*nex_fiber_yield_t)(void);
-typedef void (*nex_fiber_idle_yield_t)(void);
+typedef void (*gx_fiber_fn_t)(void *arg);
+typedef int (*gx_sched_init_t)(uint32_t nex_id);
+typedef int (*gx_sched_new_fiber_t)(gx_fiber_fn_t fn, void *arg);
+typedef void (*gx_sched_shutdown_t)(void);
+typedef void (*gx_fiber_yield_t)(void);
+typedef void (*gx_fiber_idle_yield_t)(void);
 
 struct accvm_symbols {
-    nex_sched_init_t nex_sched_init;
-    nex_sched_new_fiber_t nex_sched_new_fiber;
-    nex_sched_shutdown_t nex_sched_shutdown;
-    nex_fiber_yield_t nex_fiber_yield;
-    nex_fiber_idle_yield_t nex_fiber_idle_yield;
+    gx_sched_init_t gx_sched_init;
+    gx_sched_new_fiber_t gx_sched_new_fiber;
+    gx_sched_shutdown_t gx_sched_shutdown;
+    gx_fiber_yield_t gx_fiber_yield;
+    gx_fiber_idle_yield_t gx_fiber_idle_yield;
 };
 
 int nex_shm_dial(const char* service_id, int* fd_out);
@@ -32,8 +32,8 @@ ssize_t nex_shm_readv(int fd, const struct iovec *iov, int iovcnt,
 int nex_shm_close(int fd);
 int nex_shm_shutdown(int fd);
 void nex_fast_memcpy(void* dst, const void* src, size_t len);
-void nex_fiber_yield(void);
-void nex_fiber_idle_yield(void);
+void gx_fiber_yield(void);
+void gx_fiber_idle_yield(void);
 int get_accvm_symbols(struct accvm_symbols* syms);
 
 extern struct accvm_symbols accvm_syms;

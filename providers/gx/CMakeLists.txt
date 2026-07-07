@@ -1,5 +1,5 @@
 add_compile_options(-O2)
-rdma_provider(nex
+rdma_provider(gx
   nex.c
   nex_shm.c
   nex_tcp.c
@@ -7,7 +7,7 @@ rdma_provider(nex
 )
 
 ## Convenience target to match build script expectation
-add_custom_target(nex DEPENDS "nex-rdmav${IBVERBS_PABI_VERSION}")
+add_custom_target(gx_provider DEPENDS "gx-rdmav${IBVERBS_PABI_VERSION}")
 
 # Build test program (installed: OFF, output to build/bin)
 rdma_test_executable(test_nex test_nex.c)

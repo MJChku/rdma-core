@@ -74,7 +74,7 @@ static int wait_socket_ready(int fd, short events)
             return 0;
         if (rc < 0 && errno != EINTR)
             return -1;
-        nex_fiber_idle_yield();
+        gx_fiber_idle_yield();
     }
 }
 
@@ -240,7 +240,7 @@ static int connect_with_retry(const char *host, uint16_t port)
             close(s);
         }
         if (data_fd < 0)
-            nex_fiber_idle_yield();
+            gx_fiber_idle_yield();
     }
 
     freeaddrinfo(res);
@@ -256,7 +256,7 @@ static int write_all_sock(int sock_fd, const void *buf, size_t len)
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                nex_fiber_idle_yield();
+                gx_fiber_idle_yield();
                 continue;
             }
             return -1;
@@ -278,7 +278,7 @@ static int read_all_sock(int sock_fd, void *buf, size_t len)
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                nex_fiber_idle_yield();
+                gx_fiber_idle_yield();
                 continue;
             }
             return -1;
@@ -313,7 +313,7 @@ static int writev_all_sock(int sock_fd, const struct iovec *iov, int iovcnt, siz
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                nex_fiber_idle_yield();
+                gx_fiber_idle_yield();
                 continue;
             }
             if (local != stack_iov)
@@ -359,7 +359,7 @@ static int readv_all_sock(int sock_fd, const struct iovec *iov, int iovcnt, size
                 if (errno == EINTR)
                     continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    nex_fiber_idle_yield();
+                    gx_fiber_idle_yield();
                     continue;
                 }
                 return -1;
@@ -413,7 +413,7 @@ int nex_tcp_dial(const char *service_id, int *fd_out)
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                nex_fiber_idle_yield();
+                gx_fiber_idle_yield();
                 continue;
             }
             break;
