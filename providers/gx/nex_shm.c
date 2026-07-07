@@ -58,18 +58,10 @@ static uint32_t parse_u32(const char* s)
     return (uint32_t)v;
 }
 
-static void* get_accvm_lib(void){
-    void* handle = dlopen("accvm.so", RTLD_LAZY | RTLD_LOCAL);
-    if (!handle) {
-        NEX_ERROR("loading libaccvm.so: %s\n", dlerror());
-        return NULL;
-    }
-    return handle;
-}
-
+/* The GX fiber scheduler lives in gx_cuda.so, which is LD_PRELOADed into
+ * every emulated process; resolve its symbols from the global scope. */
 int get_accvm_symbols(struct accvm_symbols* syms) {
-    void* handle = get_accvm_lib();
-    if (!handle) return -1;
+    void* handle = RTLD_DEFAULT;
 
     syms->gx_sched_init = (gx_sched_init_t)dlsym(handle, "gx_sched_init");
     if (!syms->gx_sched_init) {
