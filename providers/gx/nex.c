@@ -644,7 +644,20 @@ static void fiber_tx_send_worker(void *arg)
 						&tx_slot);
 			bool is_read_req = task->hdr.opcode == NEX_MSG_RDMA_READ_REQ;
 			if (rc) {
-				assert(rc == 0);
+				/* Peer died mid-send: surface an error completion so the
+				 * consumer (e.g. NCCL's proxy) sees ncclRemoteError and can
+				 * abort, instead of crashing or hanging the process. */
+				struct ibv_wc err_wc = {
+					.wr_id = task->tx_wr_id,
+					.status = IBV_WC_RETRY_EXC_ERR,
+					.opcode = (task->hdr.opcode == NEX_MSG_RDMA_WRITE ||
+						   task->hdr.opcode == NEX_MSG_RDMA_WRITE_IMM)
+						  ? IBV_WC_RDMA_WRITE
+						  : IBV_WC_SEND,
+					.qp_num = qp->vqp.qp.qp_num,
+				};
+				if (task->wait_completion)
+					fiber_cq_push(qp->send_cq, &err_wc);
 			} else if (!is_read_req) {
 				struct nex_tx_wait_entry entry = {
 					.wr_id = task->tx_wr_id,
@@ -1626,9 +1639,28 @@ ERROR_OUT:
 	return errno;
 }
 
+/* Peer died: fail every posted-but-unmatched recv with an error completion.
+ * NCCL's ib net plugin turns a non-success WC into ncclRemoteError, which
+ * reaches the comm's asyncResult and lets ncclCommAbort unwedge the
+ * fiber-emulated device kernels (they already poll abortFlag). */
+static void fiber_rx_fail_pending_recvs(struct nex_qp *qp)
+{
+	struct nex_recv_entry entry;
+
+	while (fiber_try_take_recv(qp, &entry)) {
+		struct ibv_wc wc = {
+			.wr_id = entry.wr_id,
+			.status = IBV_WC_RETRY_EXC_ERR,
+			.opcode = IBV_WC_RECV,
+			.qp_num = qp->vqp.qp.qp_num,
+		};
+		fiber_cq_push(qp->recv_cq, &wc);
+	}
+}
+
 static void fiber_rx_worker(void *arg)
 {
-	
+
 	//
 	struct nex_qp *qp = arg;
 	uint8_t *payload_buf = NULL;
@@ -1657,8 +1689,13 @@ static void fiber_rx_worker(void *arg)
 			if (!qp->rx_running)
 				break;			
 			
-			if (fiber_read_full(qp->rx_fd, &hdr, sizeof(hdr), 0))  // header: no perf model
+			if (fiber_read_full(qp->rx_fd, &hdr, sizeof(hdr), 0)) {  // header: no perf model
+				/* Read failure with the QP still up = peer death (local
+				 * teardown clears rx_running first). Surface it. */
+				if (qp->rx_running)
+					fiber_rx_fail_pending_recvs(qp);
 				break;
+			}
 
 			
 			// NEX_TRACE("rx header, no perf, wr_id=%" PRIu64 " opcode=%u len=%u status=%u hdr.length=%u qp_pair=%u:%u",
