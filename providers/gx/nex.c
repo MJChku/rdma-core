@@ -375,6 +375,19 @@ static bool nex_qp_has_peer_addr(const struct nex_qp *qp)
 static bool fiber_try_take_recv(struct nex_qp *qp, struct nex_recv_entry *out)
 {
     bool ok = false;
+    if (qp->srq) {
+        /* QP is attached to a shared receive queue: consume from it. */
+        struct nex_srq *srq = qp->srq;
+        fiber_pthread_spin_lock(&srq->lock);
+        if (srq->recv_head != srq->recv_tail) {
+            struct nex_recv_entry *entry = &srq->recv_queue[srq->recv_head];
+            srq->recv_head = (srq->recv_head + 1) % srq->recv_size;
+            *out = *entry;
+            ok = true;
+        }
+        fiber_pthread_spin_unlock(&srq->lock);
+        return ok;
+    }
     fiber_pthread_spin_lock(&qp->lock);
     if (qp->recv_head != qp->recv_tail) {
         struct nex_recv_entry *entry = &qp->recv_queue[qp->recv_head];
@@ -820,6 +833,9 @@ static int nex_query_device(struct ibv_context *context,
 	attr->orig_attr.max_qp_rd_atom = 1;
 	attr->orig_attr.max_res_rd_atom = 1;
 	attr->orig_attr.max_qp_init_rd_atom = 1;
+	attr->orig_attr.max_srq = 1024;
+	attr->orig_attr.max_srq_wr = 65536;
+	attr->orig_attr.max_srq_sge = 1;
 	attr->orig_attr.phys_port_cnt = 1;
 
 	return 0;
@@ -1114,9 +1130,11 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 	qp->vqp.qp.pd = pd;
 	qp->vqp.qp.send_cq = attr->send_cq;
 	qp->vqp.qp.recv_cq = attr->recv_cq;
-	// shared receive queue (SRQ) is an optional feature that allows multiple QPs to share a single receive queue
-	// not supported here
+	/* Shared receive queue: when set, this QP's incoming SEND /
+	 * RDMA_WRITE_WITH_IMM consume recv WRs from the SRQ ring instead of
+	 * the per-QP ring (see fiber_try_take_recv). */
 	qp->vqp.qp.srq = attr->srq;
+	qp->srq = attr->srq ? to_nsrq(attr->srq) : NULL;
 	qp->vqp.qp.handle = nex_next_handle(ctx);
 	qp->vqp.qp.qp_num = nex_next_handle(ctx);
 	qp->vqp.qp.qp_type = attr->qp_type;
@@ -1458,6 +1476,100 @@ static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 	return 0;
 }
 
+/* Shared receive queue -------------------------------------------------- */
+
+static struct ibv_srq *nex_create_srq(struct ibv_pd *pd,
+				      struct ibv_srq_init_attr *attr)
+{
+	struct nex_srq *srq = calloc(1, sizeof(*srq));
+	if (!srq) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	uint32_t max_wr = attr->attr.max_wr;
+	if (max_wr == 0)
+		max_wr = 16;
+
+	/* One empty slot so the ring full/empty tests work (as per-QP rq). */
+	srq->recv_size = max_wr + 1;
+	srq->recv_queue = calloc(srq->recv_size, sizeof(*srq->recv_queue));
+	if (!srq->recv_queue) {
+		free(srq);
+		errno = ENOMEM;
+		return NULL;
+	}
+	srq->recv_head = srq->recv_tail = 0;
+	pthread_spin_init(&srq->lock, PTHREAD_PROCESS_PRIVATE);
+
+	NEX_TRACE("create_srq max_wr=%u max_sge=%u", attr->attr.max_wr,
+		  attr->attr.max_sge);
+	return &srq->ibv_srq;
+}
+
+static int nex_destroy_srq(struct ibv_srq *ibsrq)
+{
+	struct nex_srq *srq = to_nsrq(ibsrq);
+
+	pthread_spin_destroy(&srq->lock);
+	free(srq->recv_queue);
+	free(srq);
+	return 0;
+}
+
+static int nex_query_srq(struct ibv_srq *ibsrq, struct ibv_srq_attr *attr)
+{
+	struct nex_srq *srq = to_nsrq(ibsrq);
+
+	attr->max_wr = srq->recv_size - 1;
+	attr->max_sge = 1;
+	attr->srq_limit = 0;
+	return 0;
+}
+
+static int nex_post_srq_recv(struct ibv_srq *ibsrq, struct ibv_recv_wr *wr,
+			     struct ibv_recv_wr **bad_wr)
+{
+	struct nex_srq *srq = to_nsrq(ibsrq);
+
+	for (; wr; wr = wr->next) {
+		if (wr->num_sge > 1) {
+			if (bad_wr)
+				*bad_wr = wr;
+			NEX_ERROR("post_srq_recv num_sge=%d unsupported",
+				  wr->num_sge);
+			errno = ENOTSUP;
+			return ENOTSUP;
+		}
+
+		NEX_TRACE("post_srq_recv wr_id=%" PRIu64 " num_sge=%d len=%u",
+			  (uint64_t)wr->wr_id, wr->num_sge,
+			  wr->num_sge ? wr->sg_list[0].length : 0U);
+
+		/* Wait for space instead of failing, as nex_post_recv does. */
+		for (;;) {
+			pthread_spin_lock(&srq->lock);
+			uint32_t next_tail = (srq->recv_tail + 1) % srq->recv_size;
+			if (next_tail != srq->recv_head) {
+				struct nex_recv_entry *entry =
+					&srq->recv_queue[srq->recv_tail];
+				entry->wr_id = wr->wr_id;
+				if (wr->num_sge == 1)
+					entry->sge = wr->sg_list[0];
+				else
+					memset(&entry->sge, 0, sizeof(entry->sge));
+				srq->recv_tail = next_tail;
+				pthread_spin_unlock(&srq->lock);
+				break;
+			}
+			pthread_spin_unlock(&srq->lock);
+			NEX_TRACE("post_srq_recv queue full; waiting for space");
+			sched_yield();
+		}
+	}
+	return 0;
+}
+
 static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			 struct ibv_send_wr **bad_wr)
 {
@@ -1646,6 +1758,11 @@ ERROR_OUT:
 static void fiber_rx_fail_pending_recvs(struct nex_qp *qp)
 {
 	struct nex_recv_entry entry;
+
+	/* SRQ entries are shared with other (live) QPs — never drain them on
+	 * a single peer's death. */
+	if (qp->srq)
+		return;
 
 	while (fiber_try_take_recv(qp, &entry)) {
 		struct ibv_wc wc = {
@@ -1842,12 +1959,18 @@ static void fiber_rx_worker(void *arg)
 					wc_status = IBV_WC_SUCCESS;
 				}
 
+				/* IB semantics: for RDMA_WRITE_WITH_IMM the consumed recv
+				 * completes with byte_len = length of the written payload,
+				 * whether or not the recv WR carried an SGE (the data goes
+				 * to the sender-named (rkey, remote_addr), not the recv
+				 * buffer). Consumers (e.g. UCCL rc_rx_chunk) accumulate
+				 * wc->byte_len, so reporting 0 for sge-less recvs loses
+				 * the payload size. */
 				struct ibv_wc recv_wc = {
 					.wr_id    = entry_copy.wr_id,
 					.status   = wc_status,
 					.opcode   = IBV_WC_RECV_RDMA_WITH_IMM,
-					.byte_len = zero_len_imm ? 0 :
-								(entry_copy.sge.length ? (uint32_t)copy_len : 0),
+					.byte_len = zero_len_imm ? 0 : hdr.length,
 					.qp_num   = qp->vqp.qp.qp_num,
 					.imm_data = hdr.imm_data,
 				};
@@ -2222,6 +2345,10 @@ static const struct verbs_context_ops nex_ctx_ops = {
 	.destroy_cq = nex_destroy_cq,
 	.poll_cq = nex_poll_cq,
 	.req_notify_cq = nex_req_notify_cq,
+	.create_srq = nex_create_srq,
+	.destroy_srq = nex_destroy_srq,
+	.query_srq = nex_query_srq,
+	.post_srq_recv = nex_post_srq_recv,
 	.create_qp = nex_create_qp,
 	.destroy_qp = nex_destroy_qp,
 	.modify_qp = nex_modify_qp,

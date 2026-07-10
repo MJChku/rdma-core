@@ -53,6 +53,22 @@ struct nex_recv_entry {
 	struct ibv_sge sge;
 };
 
+/*
+ * Shared receive queue: a recv ring identical to the per-QP one, shared by
+ * every QP created with ibv_qp_init_attr.srq set. Consumers (rx fibers of
+ * the attached QPs) pop entries under the SRQ lock instead of the QP lock.
+ * Needed by consumers like UCCL whose data path posts all recv WRs to one
+ * SRQ (rdma_io.h SharedIOContext).
+ */
+struct nex_srq {
+	struct ibv_srq ibv_srq;
+	struct nex_recv_entry *recv_queue;
+	uint32_t recv_size;
+	uint32_t recv_head;
+	uint32_t recv_tail;
+	pthread_spinlock_t lock;
+};
+
 struct nex_pending_msg;
 
 struct nex_pending_read {
@@ -78,6 +94,7 @@ struct nex_qp {
 	uint32_t recv_size;
 	uint32_t recv_head;
 	uint32_t recv_tail;
+	struct nex_srq *srq;	/* non-NULL: recvs come from the SRQ */
 	int tx_fd;
 	int rx_fd;
 	bool rx_running;
@@ -156,6 +173,11 @@ static inline struct nex_qp *to_nqp(struct ibv_qp *ibqp)
 static inline struct nex_mr *to_nmr(struct ibv_mr *ibmr)
 {
 	return container_of(ibmr, struct nex_mr, vmr.ibv_mr);
+}
+
+static inline struct nex_srq *to_nsrq(struct ibv_srq *ibsrq)
+{
+	return container_of(ibsrq, struct nex_srq, ibv_srq);
 }
 
 #endif /* NEX_H */
