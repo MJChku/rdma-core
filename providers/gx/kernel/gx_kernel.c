@@ -21,7 +21,7 @@ MODULE_PARM_DESC(ifname, "netdev to bind (e.g., eth0)");
 struct nex_dev {
 	struct ib_device base_dev;     /* must match ib_alloc_device(...) member */
 	s8           numa_node;
-	u8           raw_gid[ETH_ALEN];
+	u8           raw_gid[16];
 	struct net_device *netdev;     /* held while device is registered */
 };
 
@@ -197,8 +197,7 @@ static int nex_query_gid(struct ib_device *d, u32 port, int idx, union ib_gid *g
 	struct nex_dev *n = to_nex(d);
 	if (port != 1 || idx != 0) return -EINVAL;
 	memset(gid, 0, sizeof(*gid));
-	/* RoCE v1-style local-ID hack: just stash MAC in low bytes */
-	memcpy(gid->raw, n->raw_gid, ETH_ALEN);
+	memcpy(gid->raw, n->raw_gid, sizeof(n->raw_gid));
 	return 0;
 }
 
@@ -278,7 +277,14 @@ static int __init nex_init(void)
 	ibd->phys_port_cnt  = 1;
 	ibd->num_comp_vectors = 1;
 	ibd->local_dma_lkey = 0;
-	memset(nex->raw_gid, 0, ETH_ALEN);
+	/* A registered RDMA port must expose a non-empty GID even when GX is not
+	 * bound to a host netdev. Use a deterministic link-local identity; when a
+	 * netdev exists its MAC replaces the interface-id tail below. */
+	memset(nex->raw_gid, 0, sizeof(nex->raw_gid));
+	nex->raw_gid[0] = 0xfe;
+	nex->raw_gid[1] = 0x80;
+	nex->raw_gid[8] = 0x02;
+	nex->raw_gid[15] = 0x01;
 	ibd->dev.parent = NULL;
 	ibd->dma_device = NULL;
 
@@ -288,7 +294,8 @@ static int __init nex_init(void)
 		if (ndev->addr_len) {
 			memcpy(mac, ndev->dev_addr,
 			       min_t(unsigned int, ndev->addr_len, ETH_ALEN));
-			memcpy(nex->raw_gid, mac, ETH_ALEN);
+			memcpy(nex->raw_gid + sizeof(nex->raw_gid) - ETH_ALEN,
+			       mac, ETH_ALEN);
 			if (is_valid_ether_addr(mac))
 				node_guid = cpu_to_be64(((u64)mac[0] << 56) |
 						((u64)mac[1] << 48) |

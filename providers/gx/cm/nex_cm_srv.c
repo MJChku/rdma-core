@@ -94,7 +94,7 @@ static int send_all(int fd, const void *buf, size_t len)
 {
 	const uint8_t *p = buf;
 	while (len) {
-		ssize_t n = send(fd, p, len, 0);
+		ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
@@ -114,6 +114,8 @@ static int recv_all(int fd, void *buf, size_t len)
 		if (n <= 0) {
 			if (n < 0 && errno == EINTR)
 				continue;
+			if (n == 0)
+				errno = ECONNRESET;
 			return -1;
 		}
 		p += n;
@@ -127,6 +129,18 @@ static void add_pending(struct pending_entry *entry)
 	uint32_t b = hash_key(entry->service_id) % CM_PENDING_BUCKETS;
 	entry->next = pending_buckets[b];
 	pending_buckets[b] = entry;
+}
+
+static int pending_socket_alive(int fd)
+{
+	uint8_t byte;
+	ssize_t n = recv(fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+
+	if (n > 0)
+		return 1;
+	if (n == 0)
+		return 0;
+	return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
 }
 
 static int parse_service_id(const char *service_id,
@@ -163,8 +177,14 @@ static struct pending_entry *take_pending(const char *service_id)
 	uint32_t b = hash_key(peer_service_id) % CM_PENDING_BUCKETS;
 	struct pending_entry **prev = &pending_buckets[b];
 	while (*prev) {
-		if (strcmp((*prev)->service_id, peer_service_id) == 0) {
-			struct pending_entry *node = *prev;
+		struct pending_entry *node = *prev;
+		if (!pending_socket_alive(node->sock)) {
+			*prev = node->next;
+			close(node->sock);
+			free(node);
+			continue;
+		}
+		if (strcmp(node->service_id, peer_service_id) == 0) {
 			*prev = node->next;
 			node->next = NULL;
 			return node;
@@ -226,9 +246,8 @@ static void serve(int listen_fd)
 			.peer_port = htons(match->port),
 			.role = NEX_CM_ROLE_CONNECT,
 		};
-		strncpy(rsp_connect.peer_host, match->host, sizeof(rsp_connect.peer_host) - 1);
-		send_all(fd, &rsp_connect, sizeof(rsp_connect));
-		close(fd);
+		strncpy(rsp_connect.peer_host, match->host,
+			sizeof(rsp_connect.peer_host) - 1);
 
 		struct nex_cm_rsp rsp_listen = {
 			.peer_qp_num = htonl(qp_num),
@@ -236,15 +255,43 @@ static void serve(int listen_fd)
 			.role = NEX_CM_ROLE_LISTEN,
 		};
 		strncpy(rsp_listen.peer_host, connect_host, sizeof(rsp_listen.peer_host) - 1);
-		send_all(match->sock, &rsp_listen, sizeof(rsp_listen));
+		if (send_all(match->sock, &rsp_listen, sizeof(rsp_listen)) != 0) {
+			perror("send pending peer");
+			close(match->sock);
+			free(match);
+
+			/* The pending peer disappeared between the liveness check and
+			 * this response. Keep the current peer available for its real
+			 * counterpart instead of pairing it with the stale request. */
+			struct pending_entry *entry = calloc(1, sizeof(*entry));
+			if (!entry) {
+				close(fd);
+				continue;
+			}
+			entry->sock = fd;
+			entry->qp_num = qp_num;
+			entry->port = port;
+			strncpy(entry->service_id, req.service_id,
+				sizeof(entry->service_id) - 1);
+			strncpy(entry->host, connect_host, sizeof(entry->host) - 1);
+			add_pending(entry);
+			continue;
+		}
 		close(match->sock);
 		free(match);
+
+		if (send_all(fd, &rsp_connect, sizeof(rsp_connect)) != 0)
+			perror("send connecting peer");
+		close(fd);
 	}
 }
 
 int main(void)
 {
 	raise_nofile_best_effort();
+	/* A peer can disappear while waiting for its counterpart. Never let a
+	 * failed rendezvous response terminate the shared CM service. */
+	(void)signal(SIGPIPE, SIG_IGN);
 
 	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (listen_fd < 0) {

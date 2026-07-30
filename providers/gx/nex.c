@@ -60,17 +60,25 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-#define DEBUG
-
 #define NEX_INFO(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 
 #define NEX_ERROR(fmt, ...) fprintf(stderr, "ERROR: nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 
-#ifdef DEBUG
-#define NEX_TRACE(fmt, ...) fprintf(stderr, "nex (%d, %lu ns): " fmt "\n", get_nex_id(), now_ns(), ##__VA_ARGS__)
-#else
-#define NEX_TRACE(fmt, ...) do { } while (0)
-#endif
+static bool nex_trace_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *value = getenv("GX_RDMA_TRACE");
+		enabled = value && *value && strcmp(value, "0") != 0;
+	}
+	return enabled;
+}
+
+#define NEX_TRACE(fmt, ...) do { \
+	if (nex_trace_enabled()) \
+		fprintf(stderr, "nex (%d, %lu ns): " fmt "\n", \
+			get_nex_id(), now_ns(), ##__VA_ARGS__); \
+} while (0)
 
 #ifndef IBV_LINK_WIDTH_1X
 #define IBV_LINK_WIDTH_1X 1
@@ -1029,6 +1037,22 @@ static int nex_req_notify_cq(struct ibv_cq *ibcq, int solicited_only)
 
 /* Queue Pair ------------------------------------------------------------ */
 
+static void nex_wr_start(struct ibv_qp_ex *ibqpx);
+static int nex_wr_complete(struct ibv_qp_ex *ibqpx);
+static void nex_wr_abort(struct ibv_qp_ex *ibqpx);
+static void nex_wr_rdma_read(struct ibv_qp_ex *ibqpx, uint32_t rkey,
+			     uint64_t remote_addr);
+static void nex_wr_rdma_write(struct ibv_qp_ex *ibqpx, uint32_t rkey,
+			      uint64_t remote_addr);
+static void nex_wr_rdma_write_imm(struct ibv_qp_ex *ibqpx, uint32_t rkey,
+				  uint64_t remote_addr, __be32 imm_data);
+static void nex_wr_set_inline_data(struct ibv_qp_ex *ibqpx, void *addr,
+				   size_t length);
+static void nex_wr_set_sge(struct ibv_qp_ex *ibqpx, uint32_t lkey,
+			   uint64_t addr, uint32_t length);
+static void nex_wr_set_sge_list(struct ibv_qp_ex *ibqpx, size_t num_sge,
+				const struct ibv_sge *sg_list);
+
 static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
                     struct ibv_qp_init_attr *attr)
 {
@@ -1117,6 +1141,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 		return NULL;
 	}
 	qp->tx_wait_head = qp->tx_wait_tail = 0;
+	pthread_spin_init(&qp->ex_lock, PTHREAD_PROCESS_PRIVATE);
 
 	atomic_init(&qp->tx_running, false);
 	qp->next_tag = 1;
@@ -1148,6 +1173,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 		pthread_mutex_destroy(&qp->state_lock);
 		pthread_cond_destroy(&qp->state_cond);
 		pthread_spin_destroy(&qp->send_task_lock);
+		pthread_spin_destroy(&qp->ex_lock);
 		free(qp->send_task_queue);
 		free(qp->tx_wait_queue);
 		pthread_mutex_destroy(&qp->vqp.qp.mutex);
@@ -1159,6 +1185,39 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 	}
 
 	return &qp->vqp.qp;
+}
+
+static struct ibv_qp *nex_create_qp_ex(struct ibv_context *context,
+				       struct ibv_qp_init_attr_ex *attr)
+{
+	(void)context;
+	const uint64_t supported = IBV_QP_EX_WITH_RDMA_WRITE |
+		IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM | IBV_QP_EX_WITH_RDMA_READ;
+	if (!(attr->comp_mask & IBV_QP_INIT_ATTR_PD) || !attr->pd ||
+	    (attr->send_ops_flags & ~supported)) {
+		errno = EOPNOTSUPP;
+		return NULL;
+	}
+
+	struct ibv_qp *ibqp = nex_create_qp(
+		attr->pd, (struct ibv_qp_init_attr *)attr);
+	if (!ibqp)
+		return NULL;
+	struct nex_qp *qp = to_nqp(ibqp);
+	qp->vqp.comp_mask |= VERBS_QP_EX;
+	qp->vqp.qp_ex.wr_start = nex_wr_start;
+	qp->vqp.qp_ex.wr_complete = nex_wr_complete;
+	qp->vqp.qp_ex.wr_abort = nex_wr_abort;
+	qp->vqp.qp_ex.wr_set_inline_data = nex_wr_set_inline_data;
+	qp->vqp.qp_ex.wr_set_sge = nex_wr_set_sge;
+	qp->vqp.qp_ex.wr_set_sge_list = nex_wr_set_sge_list;
+	if (attr->send_ops_flags & IBV_QP_EX_WITH_RDMA_READ)
+		qp->vqp.qp_ex.wr_rdma_read = nex_wr_rdma_read;
+	if (attr->send_ops_flags & IBV_QP_EX_WITH_RDMA_WRITE)
+		qp->vqp.qp_ex.wr_rdma_write = nex_wr_rdma_write;
+	if (attr->send_ops_flags & IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM)
+		qp->vqp.qp_ex.wr_rdma_write_imm = nex_wr_rdma_write_imm;
+	return ibqp;
 }
 
 static int nex_destroy_qp(struct ibv_qp *ibqp)
@@ -1252,6 +1311,7 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 	}
 	qp->pending_head = qp->pending_tail = NULL;
 	pthread_spin_destroy(&qp->send_task_lock);
+	pthread_spin_destroy(&qp->ex_lock);
 	free(qp->send_task_queue);
 	free(qp->tx_wait_queue);
 	free(qp->recv_queue);
@@ -1702,21 +1762,57 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		if ((wr->opcode == IBV_WR_SEND ||
 		     wr->opcode == IBV_WR_RDMA_WRITE ||
 		     wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM) && total_len) {
-			payload_iov = calloc((size_t)wr->num_sge, sizeof(*payload_iov));
-			if (!payload_iov) {
-				if (bad_wr)
-					*bad_wr = wr;
-				errno = ENOMEM;
-				goto ERROR_OUT;
-			}
-			for (int i = 0; i < wr->num_sge; ++i) {
-				if (wr->sg_list[i].length == 0)
-					continue;
-				payload_iov[payload_iovcnt].iov_base =
-					(void *)(uintptr_t)wr->sg_list[i].addr;
-				payload_iov[payload_iovcnt].iov_len =
-					wr->sg_list[i].length;
-				++payload_iovcnt;
+			if (wr->send_flags & IBV_SEND_INLINE) {
+				/* Inline verbs semantics allow the caller to reuse every SGE
+				 * as soon as ibv_post_send returns. The GX transport sends on
+				 * a worker fiber, so retain an owned snapshot rather than SGE
+				 * pointers into memory UCCL may immediately recycle. Keep the
+				 * bytes adjacent to the sole iovec so the existing task cleanup
+				 * frees both with one free(payload_iov). */
+				if (total_len > NEX_MAX_INLINE_DATA ||
+				    total_len > SIZE_MAX - sizeof(*payload_iov)) {
+					if (bad_wr)
+						*bad_wr = wr;
+					errno = ENOSPC;
+					goto ERROR_OUT;
+				}
+				payload_iov = malloc(sizeof(*payload_iov) + total_len);
+				if (!payload_iov) {
+					if (bad_wr)
+						*bad_wr = wr;
+					errno = ENOMEM;
+					goto ERROR_OUT;
+				}
+				uint8_t *dst = (uint8_t *)(payload_iov + 1);
+				for (int i = 0; i < wr->num_sge; ++i) {
+					uint32_t len = wr->sg_list[i].length;
+					if (!len)
+						continue;
+					memcpy(dst, (const void *)(uintptr_t)wr->sg_list[i].addr,
+					       len);
+					dst += len;
+				}
+				payload_iov[0].iov_base = payload_iov + 1;
+				payload_iov[0].iov_len = total_len;
+				payload_iovcnt = 1;
+			} else {
+				payload_iov = calloc((size_t)wr->num_sge,
+						     sizeof(*payload_iov));
+				if (!payload_iov) {
+					if (bad_wr)
+						*bad_wr = wr;
+					errno = ENOMEM;
+					goto ERROR_OUT;
+				}
+				for (int i = 0; i < wr->num_sge; ++i) {
+					if (wr->sg_list[i].length == 0)
+						continue;
+					payload_iov[payload_iovcnt].iov_base =
+						(void *)(uintptr_t)wr->sg_list[i].addr;
+					payload_iov[payload_iovcnt].iov_len =
+						wr->sg_list[i].length;
+					++payload_iovcnt;
+				}
 			}
 		}
 
@@ -1749,6 +1845,114 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 
 ERROR_OUT:
 	return errno;
+}
+
+/* Extended posting API -------------------------------------------------- */
+
+static inline struct nex_qp *nex_qpx(struct ibv_qp_ex *ibqpx)
+{
+	return container_of(ibqpx, struct nex_qp, vqp.qp_ex);
+}
+
+static void nex_wr_start(struct ibv_qp_ex *ibqpx)
+{
+	struct nex_qp *qp = nex_qpx(ibqpx);
+	pthread_spin_lock(&qp->ex_lock);
+	memset(&qp->ex_wr, 0, sizeof(qp->ex_wr));
+	memset(qp->ex_sge, 0, sizeof(qp->ex_sge));
+	qp->ex_has_inline_data = false;
+	qp->ex_error = 0;
+}
+
+static void nex_wr_rdma_read(struct ibv_qp_ex *ibqpx, uint32_t rkey,
+			     uint64_t remote_addr)
+{
+	struct nex_qp *qp = nex_qpx(ibqpx);
+	qp->ex_wr.opcode = IBV_WR_RDMA_READ;
+	qp->ex_wr.wr.rdma.rkey = rkey;
+	qp->ex_wr.wr.rdma.remote_addr = remote_addr;
+}
+
+static void nex_wr_rdma_write(struct ibv_qp_ex *ibqpx, uint32_t rkey,
+			      uint64_t remote_addr)
+{
+	struct nex_qp *qp = nex_qpx(ibqpx);
+	qp->ex_wr.opcode = IBV_WR_RDMA_WRITE;
+	qp->ex_wr.wr.rdma.rkey = rkey;
+	qp->ex_wr.wr.rdma.remote_addr = remote_addr;
+}
+
+static void nex_wr_rdma_write_imm(struct ibv_qp_ex *ibqpx, uint32_t rkey,
+				  uint64_t remote_addr, __be32 imm_data)
+{
+	struct nex_qp *qp = nex_qpx(ibqpx);
+	qp->ex_wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+	qp->ex_wr.wr.rdma.rkey = rkey;
+	qp->ex_wr.wr.rdma.remote_addr = remote_addr;
+	qp->ex_wr.imm_data = imm_data;
+}
+
+static void nex_wr_set_inline_data(struct ibv_qp_ex *ibqpx, void *addr,
+				   size_t length)
+{
+	struct nex_qp *qp = nex_qpx(ibqpx);
+	if (length > NEX_MAX_INLINE_DATA) {
+		qp->ex_error = ENOSPC;
+		return;
+	}
+	memcpy(qp->ex_inline_data, addr, length);
+	qp->ex_sge[0] = (struct ibv_sge){
+		.addr = (uintptr_t)qp->ex_inline_data,
+		.length = (uint32_t)length,
+		.lkey = 0,
+	};
+	qp->ex_wr.sg_list = qp->ex_sge;
+	qp->ex_wr.num_sge = length ? 1 : 0;
+	qp->ex_has_inline_data = true;
+}
+
+static void nex_wr_set_sge(struct ibv_qp_ex *ibqpx, uint32_t lkey,
+			   uint64_t addr, uint32_t length)
+{
+	struct nex_qp *qp = nex_qpx(ibqpx);
+	qp->ex_has_inline_data = false;
+	qp->ex_sge[0] = (struct ibv_sge){.addr = addr, .length = length, .lkey = lkey};
+	qp->ex_wr.sg_list = qp->ex_sge;
+	qp->ex_wr.num_sge = length ? 1 : 0;
+}
+
+static void nex_wr_set_sge_list(struct ibv_qp_ex *ibqpx, size_t num_sge,
+				const struct ibv_sge *sg_list)
+{
+	struct nex_qp *qp = nex_qpx(ibqpx);
+	if (num_sge > NEX_MAX_SGE) {
+		qp->ex_error = ENOSPC;
+		return;
+	}
+	qp->ex_has_inline_data = false;
+	memcpy(qp->ex_sge, sg_list, num_sge * sizeof(*sg_list));
+	qp->ex_wr.sg_list = qp->ex_sge;
+	qp->ex_wr.num_sge = (int)num_sge;
+}
+
+static int nex_wr_complete(struct ibv_qp_ex *ibqpx)
+{
+	struct nex_qp *qp = nex_qpx(ibqpx);
+	int rc = qp->ex_error;
+	if (!rc) {
+		qp->ex_wr.wr_id = ibqpx->wr_id;
+		qp->ex_wr.send_flags = ibqpx->wr_flags |
+			(qp->ex_has_inline_data ? IBV_SEND_INLINE : 0);
+		struct ibv_send_wr *bad_wr = NULL;
+		rc = nex_post_send(&qp->vqp.qp, &qp->ex_wr, &bad_wr);
+	}
+	pthread_spin_unlock(&qp->ex_lock);
+	return rc;
+}
+
+static void nex_wr_abort(struct ibv_qp_ex *ibqpx)
+{
+	pthread_spin_unlock(&nex_qpx(ibqpx)->ex_lock);
 }
 
 /* Peer died: fail every posted-but-unmatched recv with an error completion.
@@ -2350,6 +2554,7 @@ static const struct verbs_context_ops nex_ctx_ops = {
 	.query_srq = nex_query_srq,
 	.post_srq_recv = nex_post_srq_recv,
 	.create_qp = nex_create_qp,
+	.create_qp_ex = nex_create_qp_ex,
 	.destroy_qp = nex_destroy_qp,
 	.modify_qp = nex_modify_qp,
 	.query_qp = nex_query_qp,

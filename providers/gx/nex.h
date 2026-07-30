@@ -13,6 +13,7 @@
 #include <stddef.h>
 
 #define NEX_MAX_SGE           8
+#define NEX_MAX_INLINE_DATA   256
 
 struct nex_device {
 	struct verbs_device ibv_dev;
@@ -132,6 +133,16 @@ struct nex_qp {
 
 	atomic_bool tx_running;
 	uint32_t next_tag;
+
+	/* libibverbs extended QP builder state. UCCL uses ibv_wr_* for
+	 * read/write/write-with-imm; wr_complete submits this ordinary WR through
+	 * the same transport and completion path as ibv_post_send. */
+	struct ibv_send_wr ex_wr;
+	struct ibv_sge ex_sge[NEX_MAX_SGE];
+	uint8_t ex_inline_data[NEX_MAX_INLINE_DATA];
+	bool ex_has_inline_data;
+	int ex_error;
+	pthread_spinlock_t ex_lock;
 };
 
 struct nex_mr {

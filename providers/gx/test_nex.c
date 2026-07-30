@@ -233,7 +233,9 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-    const char *preferred = NULL;
+	const char *preferred = getenv("GX_RDMA_DEVICE");
+	if (!preferred || !*preferred)
+		preferred = "gx0";
 
 	/* Try exact match first if caller requested one */
 	dev = NULL;
@@ -250,7 +252,16 @@ int main(int argc, char *argv[])
 				preferred);
 	}
 
-	/* Otherwise, prefer a NEX device, then fall back to SIW */
+	/* Otherwise, prefer a GX device, then retain legacy fallbacks. */
+	if (!dev) {
+		for (int i = 0; dev_list[i]; ++i) {
+			const char *dev_name = ibv_get_device_name(dev_list[i]);
+			if (strstr(dev_name, "gx")) {
+				dev = dev_list[i];
+				break;
+			}
+		}
+	}
 	if (!dev) {
 		for (int i = 0; dev_list[i]; ++i) {
 			const char *dev_name = ibv_get_device_name(dev_list[i]);
@@ -271,7 +282,7 @@ int main(int argc, char *argv[])
 	}
 
 	if (!dev) {
-		fprintf(stderr, "No usable RDMA device (nex/siw) found\n");
+		fprintf(stderr, "No usable RDMA device (gx/nex/siw) found\n");
 		ibv_free_device_list(dev_list);
 		return 1;
 	}
@@ -323,6 +334,7 @@ int main(int argc, char *argv[])
 	qp_init_attr.cap.max_recv_wr = 10;
 	qp_init_attr.cap.max_send_sge = 1;
 	qp_init_attr.cap.max_recv_sge = 1;
+	qp_init_attr.cap.max_inline_data = strlen(TEST_MSG) + 1;
 	qp_init_attr.qp_type = IBV_QPT_RC;
 
     qp = ibv_create_qp(pd, &qp_init_attr);
@@ -439,7 +451,7 @@ int main(int argc, char *argv[])
 	send_wr.sg_list = &send_sge;
 	send_wr.num_sge = 1;
 	send_wr.opcode = IBV_WR_SEND;
-	send_wr.send_flags = IBV_SEND_SIGNALED;
+	send_wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
 
 	struct ibv_send_wr *bad_send_wr;
 	ret = ibv_post_send(qp, &send_wr, &bad_send_wr);
@@ -447,6 +459,9 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Failed to post send: %s\n", strerror(ret));
 		goto cleanup_qp;
 	}
+	/* Inline sends snapshot their SGEs before ibv_post_send returns. Reusing
+	 * the source immediately must not change what the peer receives. */
+	memset(buf, 0, strlen(TEST_MSG) + 1);
 
 	/* Poll for both send and recv completions */
 	int got_send = 0, got_recv = 0;
@@ -468,11 +483,18 @@ int main(int argc, char *argv[])
 		if (got_send && got_recv)
 			break;
 	}
+	if (strcmp(buf, TEST_MSG) != 0) {
+		fprintf(stderr, "Inline payload changed after source reuse: got '%s'\n",
+			buf);
+		ret = EIO;
+		goto cleanup_qp;
+	}
 
 	printf("✅ NEX RDMA provider test completed successfully!\n");
 	printf("   - Device: %s\n", ibv_get_device_name(dev));
 	printf("   - QP Number: %d\n", qp->qp_num);
 	printf("   - Both send and recv completed.\n");
+	printf("   - Inline source reuse preserved the posted payload.\n");
 
 cleanup_qp:
     if (qp)

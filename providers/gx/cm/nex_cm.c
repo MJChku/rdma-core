@@ -152,7 +152,7 @@ static int send_all(int fd, const void *buf, size_t len)
 {
 	const uint8_t *p = buf;
 	while (len) {
-		ssize_t n = send(fd, p, len, 0);
+		ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
@@ -180,6 +180,8 @@ static int recv_all(int fd, void *buf, size_t len)
 				cm_idle_yield();
 				continue;
 			}
+			if (n == 0)
+				errno = ECONNRESET;
 			return -1;
 		}
 		p += n;
