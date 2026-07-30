@@ -42,6 +42,8 @@ struct nex_pd {
 struct nex_cq {
 	struct verbs_cq vcq;
 	struct ibv_wc *entries;
+	/* Current entry exposed through ibv_cq_ex while start_poll holds lock. */
+	struct ibv_wc current_wc;
 	uint32_t capacity;
 	uint32_t head;
 	uint32_t tail;
@@ -77,6 +79,7 @@ struct nex_pending_read {
 	int num_sge;
 	size_t total_len;
 	bool completion_requested;
+	enum ibv_wc_opcode wc_opcode;
 	struct ibv_sge sge[NEX_MAX_SGE];
 	struct nex_pending_read *next;
 };
@@ -133,6 +136,8 @@ struct nex_qp {
 
 	atomic_bool tx_running;
 	uint32_t next_tag;
+	/* Serializes each framed header+payload write across TX/RX fibers. */
+	pthread_spinlock_t tx_wire_lock;
 
 	/* libibverbs extended QP builder state. UCCL uses ibv_wr_* for
 	 * read/write/write-with-imm; wr_complete submits this ordinary WR through

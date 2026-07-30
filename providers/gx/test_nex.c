@@ -7,13 +7,17 @@
  */
 
 #include <arpa/inet.h>
+#include <endian.h>
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sched.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 #include <infiniband/verbs.h>
 
@@ -29,10 +33,16 @@ struct conn_config {
 	enum conn_mode mode;
 	char host[128];
 	uint16_t port;
+	bool use_cq_ex;
+	bool cq_ex_create_only;
 };
 
 struct handshake_msg {
 	uint32_t qp_num;
+	uint32_t rkey;
+	uint16_t lid;
+	uint16_t reserved;
+	uint64_t atomic_addr;
 };
 
 static int parse_endpoint(const char *arg, char *host, size_t host_sz, uint16_t *port)
@@ -85,7 +95,13 @@ static int recv_all(int fd, void *buf, size_t len)
 	return 0;
 }
 
-static int exchange_conn_listen(const struct conn_config *cfg, uint32_t local_qp, uint32_t *remote_qp)
+static int exchange_conn_listen(const struct conn_config *cfg,
+				uint32_t local_qp, uint32_t local_rkey,
+				uint16_t local_lid,
+				uint64_t local_atomic_addr,
+				uint32_t *remote_qp, uint32_t *remote_rkey,
+				uint16_t *remote_lid,
+				uint64_t *remote_atomic_addr)
 {
 	char portbuf[16];
 	struct addrinfo hints = {
@@ -126,13 +142,21 @@ static int exchange_conn_listen(const struct conn_config *cfg, uint32_t local_qp
 		goto out;
 	}
 
-	struct handshake_msg msg = { .qp_num = htonl(local_qp) };
+	struct handshake_msg msg = {
+		.qp_num = htonl(local_qp),
+		.rkey = htonl(local_rkey),
+		.lid = htons(local_lid),
+		.atomic_addr = htobe64(local_atomic_addr),
+	};
 	if (send_all(conn_fd, &msg, sizeof(msg)) ||
 	    recv_all(conn_fd, &msg, sizeof(msg))) {
 		perror("exchange");
 		goto out;
 	}
 	*remote_qp = ntohl(msg.qp_num);
+	*remote_rkey = ntohl(msg.rkey);
+	*remote_lid = ntohs(msg.lid);
+	*remote_atomic_addr = be64toh(msg.atomic_addr);
 	ret = 0;
 out:
 	if (conn_fd >= 0)
@@ -142,7 +166,13 @@ out:
 	return ret;
 }
 
-static int exchange_conn_connect(const struct conn_config *cfg, uint32_t local_qp, uint32_t *remote_qp)
+static int exchange_conn_connect(const struct conn_config *cfg,
+				 uint32_t local_qp, uint32_t local_rkey,
+				 uint16_t local_lid,
+				 uint64_t local_atomic_addr,
+				 uint32_t *remote_qp, uint32_t *remote_rkey,
+				 uint16_t *remote_lid,
+				 uint64_t *remote_atomic_addr)
 {
 	struct addrinfo hints = {
 		.ai_family = AF_INET,
@@ -166,7 +196,12 @@ static int exchange_conn_connect(const struct conn_config *cfg, uint32_t local_q
 	freeaddrinfo(res);
 	if (fd < 0)
 		return -1;
-	struct handshake_msg msg = { .qp_num = htonl(local_qp) };
+	struct handshake_msg msg = {
+		.qp_num = htonl(local_qp),
+		.rkey = htonl(local_rkey),
+		.lid = htons(local_lid),
+		.atomic_addr = htobe64(local_atomic_addr),
+	};
 	int ret = -1;
 	if (send_all(fd, &msg, sizeof(msg)) ||
 	    recv_all(fd, &msg, sizeof(msg))) {
@@ -174,6 +209,9 @@ static int exchange_conn_connect(const struct conn_config *cfg, uint32_t local_q
 		goto out;
 	}
 	*remote_qp = ntohl(msg.qp_num);
+	*remote_rkey = ntohl(msg.rkey);
+	*remote_lid = ntohs(msg.lid);
+	*remote_atomic_addr = be64toh(msg.atomic_addr);
 	ret = 0;
 out:
 	close(fd);
@@ -185,6 +223,8 @@ static int parse_args(int argc, char **argv, struct conn_config *cfg)
 	cfg->mode = MODE_LOOPBACK;
 	cfg->host[0] = '\0';
 	cfg->port = 0;
+	cfg->use_cq_ex = false;
+	cfg->cq_ex_create_only = false;
 	for (int i = 1; i < argc; ++i) {
 		if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
 			if (cfg->mode != MODE_LOOPBACK)
@@ -200,11 +240,61 @@ static int parse_args(int argc, char **argv, struct conn_config *cfg)
 				return -1;
 			cfg->mode = MODE_CONNECT;
 			++i;
+		} else if (strcmp(argv[i], "--cq-ex") == 0) {
+			cfg->use_cq_ex = true;
+		} else if (strcmp(argv[i], "--cq-ex-create-only") == 0) {
+			cfg->use_cq_ex = true;
+			cfg->cq_ex_create_only = true;
 		} else {
 			return -1;
 		}
 	}
 	return 0;
+}
+
+static int poll_completions(struct ibv_cq *cq, struct ibv_cq_ex *cq_ex,
+			    int max_entries, struct ibv_wc *wc)
+{
+	if (!cq_ex)
+		return ibv_poll_cq(cq, max_entries, wc);
+
+	struct ibv_poll_cq_attr attr = {};
+	int rc = ibv_start_poll(cq_ex, &attr);
+	if (rc == ENOENT)
+		return 0;
+	if (rc) {
+		errno = rc;
+		return -1;
+	}
+
+	int count = 0;
+	for (;;) {
+		struct ibv_wc *entry = &wc[count++];
+		memset(entry, 0, sizeof(*entry));
+		entry->status = cq_ex->status;
+		entry->wr_id = cq_ex->wr_id;
+		entry->opcode = ibv_wc_read_opcode(cq_ex);
+		entry->vendor_err = ibv_wc_read_vendor_err(cq_ex);
+		entry->byte_len = ibv_wc_read_byte_len(cq_ex);
+		entry->imm_data = ibv_wc_read_imm_data(cq_ex);
+		entry->qp_num = ibv_wc_read_qp_num(cq_ex);
+		entry->src_qp = ibv_wc_read_src_qp(cq_ex);
+		entry->wc_flags = ibv_wc_read_wc_flags(cq_ex);
+		entry->sl = ibv_wc_read_sl(cq_ex);
+
+		if (count == max_entries)
+			break;
+		rc = ibv_next_poll(cq_ex);
+		if (rc == ENOENT)
+			break;
+		if (rc) {
+			ibv_end_poll(cq_ex);
+			errno = rc;
+			return -1;
+		}
+	}
+	ibv_end_poll(cq_ex);
+	return count;
 }
 
 int main(int argc, char *argv[])
@@ -215,15 +305,21 @@ int main(int argc, char *argv[])
 	struct ibv_pd *pd = NULL;
 	struct ibv_mr *mr = NULL;
 	struct ibv_cq *cq = NULL;
+	struct ibv_cq_ex *cq_ex = NULL;
 	struct ibv_qp *qp = NULL;
 	struct ibv_qp_init_attr qp_init_attr;
 	struct ibv_qp_attr qp_attr;
 	int ret = 0;
+	bool success = false;
 	struct conn_config cfg;
 	uint32_t remote_qp_num;
+	uint32_t remote_rkey;
+	uint16_t local_lid;
+	uint16_t remote_lid;
+	uint64_t remote_atomic_addr;
 
 	if (parse_args(argc, argv, &cfg)) {
-		fprintf(stderr, "Usage: %s [--listen host:port | --connect host:port]\n", argv[0]);
+		fprintf(stderr, "Usage: %s [--cq-ex | --cq-ex-create-only] [--listen host:port | --connect host:port]\n", argv[0]);
 		return 1;
 	}
 
@@ -290,12 +386,19 @@ int main(int argc, char *argv[])
 	printf("Found RDMA device: %s\n", ibv_get_device_name(dev));
 
     /* Open device context */
-    ctx = ibv_open_device(dev);
+	ctx = ibv_open_device(dev);
 	if (!ctx) {
 		perror("ibv_open_device");
 		ibv_free_device_list(dev_list);
 		return 1;
 	}
+	struct ibv_port_attr port_attr = {};
+	if (ibv_query_port(ctx, 1, &port_attr)) {
+		perror("ibv_query_port");
+		ret = 1;
+		goto cleanup_ctx;
+	}
+	local_lid = port_attr.lid;
 
 	/* Allocate protection domain */
 	pd = ibv_alloc_pd(ctx);
@@ -312,18 +415,54 @@ int main(int argc, char *argv[])
 	}
 
 	mr = ibv_reg_mr(pd, buf, 4096,
-			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
+			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+			IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
 	if (!mr) {
 		perror("ibv_reg_mr");
 	ret = ENOMEM;
 	goto cleanup_buf;
 	}
+	uint64_t *atomic_target = (uint64_t *)(void *)(buf + 512);
+	uint64_t *atomic_result = (uint64_t *)(void *)(buf + 520);
+	*atomic_target = 41;
+	*atomic_result = 0;
 
 	/* Create completion queue */
-	cq = ibv_create_cq(ctx, 10, NULL, NULL, 0);
+	if (cfg.use_cq_ex) {
+		struct ibv_cq_init_attr_ex cq_attr = {
+			.cqe = 10,
+			.comp_vector = 0,
+			.wc_flags = IBV_WC_EX_WITH_BYTE_LEN |
+				    IBV_WC_EX_WITH_IMM |
+				    IBV_WC_EX_WITH_QP_NUM |
+				    IBV_WC_EX_WITH_SRC_QP |
+				    IBV_WC_EX_WITH_SL,
+		};
+		cq_ex = ibv_create_cq_ex(ctx, &cq_attr);
+		cq = cq_ex ? ibv_cq_ex_to_cq(cq_ex) : NULL;
+	} else {
+		cq = ibv_create_cq(ctx, 10, NULL, NULL, 0);
+	}
 	if (!cq) {
-		fprintf(stderr, "Failed to create CQ\n");
+		perror(cfg.use_cq_ex ? "Failed to create CQ_EX" :
+		       "Failed to create CQ");
+		ret = 1;
 		goto cleanup_mr;
+	}
+	if (cfg.cq_ex_create_only) {
+		struct ibv_wc empty_wc = {};
+		int n = ibv_poll_cq(cq, 1, &empty_wc);
+		if (n != 0) {
+			fprintf(stderr,
+				"CQ_EX legacy empty poll returned %d instead of 0\n",
+				n);
+			ret = 1;
+			goto cleanup_cq;
+		}
+		printf("NEX_CQ_EX_CREATE_CHECK PASS cqe=%d legacy_poll=0\n",
+		       cq->cqe);
+		success = true;
+		goto cleanup_cq;
 	}
 
     /* Create queue pair */
@@ -346,13 +485,20 @@ int main(int argc, char *argv[])
 	printf("Successfully created QP with number: %d\n", qp->qp_num);
 
 	remote_qp_num = qp->qp_num;
+	remote_rkey = mr->rkey;
+	remote_lid = local_lid;
+	remote_atomic_addr = (uintptr_t)atomic_target;
 	if (cfg.mode == MODE_LISTEN) {
 		char envbuf[256];
 		snprintf(envbuf, sizeof(envbuf), "%s:%u",
 			 cfg.host[0] ? cfg.host : "127.0.0.1", cfg.port);
 		setenv("NEX_LISTEN", envbuf, 1);
 		unsetenv("NEX_CONNECT");
-		if (exchange_conn_listen(&cfg, qp->qp_num, &remote_qp_num)) {
+		if (exchange_conn_listen(&cfg, qp->qp_num, mr->rkey, local_lid,
+					 (uintptr_t)atomic_target,
+					 &remote_qp_num, &remote_rkey,
+					 &remote_lid,
+					 &remote_atomic_addr)) {
 			fprintf(stderr, "Connection exchange failed\n");
 			goto cleanup_qp;
 		}
@@ -361,7 +507,11 @@ int main(int argc, char *argv[])
 		snprintf(envbuf, sizeof(envbuf), "%s:%u", cfg.host, cfg.port);
 		setenv("NEX_CONNECT", envbuf, 1);
 		unsetenv("NEX_LISTEN");
-		if (exchange_conn_connect(&cfg, qp->qp_num, &remote_qp_num)) {
+		if (exchange_conn_connect(&cfg, qp->qp_num, mr->rkey, local_lid,
+					  (uintptr_t)atomic_target,
+					  &remote_qp_num, &remote_rkey,
+					  &remote_lid,
+					  &remote_atomic_addr)) {
 			fprintf(stderr, "Connection exchange failed\n");
 			goto cleanup_qp;
 		}
@@ -393,7 +543,8 @@ int main(int argc, char *argv[])
 	qp_attr.qp_state = IBV_QPS_INIT;
 	qp_attr.port_num = 1;
 	qp_attr.pkey_index = 0;
-	qp_attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+	qp_attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+		IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
 
 	ret = ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
 	if (ret) {
@@ -408,6 +559,8 @@ int main(int argc, char *argv[])
 	qp_attr.qp_state = IBV_QPS_RTR;
 	qp_attr.path_mtu = IBV_MTU_1024;
 	qp_attr.dest_qp_num = remote_qp_num;
+	qp_attr.ah_attr.dlid = remote_lid;
+	qp_attr.ah_attr.port_num = 1;
 	qp_attr.rq_psn = 0;
 	qp_attr.max_dest_rd_atomic = 1;
 	qp_attr.min_rnr_timer = 12;
@@ -466,20 +619,25 @@ int main(int argc, char *argv[])
 	/* Poll for both send and recv completions */
 	int got_send = 0, got_recv = 0;
 	for (;;) {
-		struct ibv_wc wc;
-		int n = ibv_poll_cq(cq, 1, &wc);
+		struct ibv_wc wc[2];
+		int n = poll_completions(cq, cq_ex, 2, wc);
 		if (n < 0) {
 			fprintf(stderr, "Failed to poll CQ\n");
 			goto cleanup_qp;
 		}
 		if (n == 0)
 			continue;
-		if (wc.status != IBV_WC_SUCCESS) {
-			fprintf(stderr, "Completion error: op=%d status=%d\n", wc.opcode, wc.status);
-			goto cleanup_qp;
+		for (int i = 0; i < n; ++i) {
+			if (wc[i].status != IBV_WC_SUCCESS) {
+				fprintf(stderr, "Completion error: op=%d status=%d\n",
+					wc[i].opcode, wc[i].status);
+				goto cleanup_qp;
+			}
+			if (wc[i].opcode == IBV_WC_SEND)
+				got_send = 1;
+			if (wc[i].opcode == IBV_WC_RECV)
+				got_recv = 1;
 		}
-		if (wc.opcode == IBV_WC_SEND) got_send = 1;
-		if (wc.opcode == IBV_WC_RECV) got_recv = 1;
 		if (got_send && got_recv)
 			break;
 	}
@@ -490,8 +648,81 @@ int main(int argc, char *argv[])
 		goto cleanup_qp;
 	}
 
+	{
+		struct ibv_sge atomic_sge = {
+			.addr = (uintptr_t)atomic_result,
+			.length = sizeof(*atomic_result),
+			.lkey = mr->lkey,
+		};
+		struct ibv_send_wr atomic_wr = {
+			.wr_id = 0xADD,
+			.sg_list = &atomic_sge,
+			.num_sge = 1,
+			.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD,
+			.send_flags = IBV_SEND_SIGNALED,
+		};
+		atomic_wr.wr.atomic.remote_addr = remote_atomic_addr;
+		atomic_wr.wr.atomic.rkey = remote_rkey;
+		atomic_wr.wr.atomic.compare_add = 7;
+		ret = ibv_post_send(qp, &atomic_wr, &bad_send_wr);
+		if (ret) {
+			fprintf(stderr, "Failed to post atomic fetch-add: %s\n",
+				strerror(ret));
+			goto cleanup_qp;
+		}
+
+		for (;;) {
+			struct ibv_wc wc = {};
+			int n = poll_completions(cq, cq_ex, 1, &wc);
+			if (n < 0) {
+				fprintf(stderr, "Failed to poll atomic CQ\n");
+				ret = EIO;
+				goto cleanup_qp;
+			}
+			if (n == 0)
+				continue;
+			if (wc.status != IBV_WC_SUCCESS ||
+			    wc.opcode != IBV_WC_FETCH_ADD) {
+				fprintf(stderr, "Atomic completion error: op=%d status=%d\n",
+					wc.opcode, wc.status);
+				ret = EIO;
+				goto cleanup_qp;
+			}
+			break;
+		}
+		/* Each endpoint posts one operation.  Our completion proves that the
+		 * peer's target changed, but its reciprocal request may still be in
+		 * flight.  Wait briefly for that independently ordered update. */
+		struct timespec atomic_deadline;
+		clock_gettime(CLOCK_MONOTONIC, &atomic_deadline);
+		atomic_deadline.tv_sec += 5;
+		while (__atomic_load_n(atomic_target, __ATOMIC_ACQUIRE) != 48) {
+			struct timespec now;
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			if (now.tv_sec > atomic_deadline.tv_sec ||
+			    (now.tv_sec == atomic_deadline.tv_sec &&
+			     now.tv_nsec >= atomic_deadline.tv_nsec))
+				break;
+			sched_yield();
+		}
+		if (*atomic_result != 41 ||
+		    __atomic_load_n(atomic_target, __ATOMIC_ACQUIRE) != 48) {
+			fprintf(stderr,
+				"Atomic fetch-add mismatch: fetched=%llu remote=%llu\n",
+				(unsigned long long)*atomic_result,
+				(unsigned long long)*atomic_target);
+			ret = EIO;
+			goto cleanup_qp;
+		}
+		printf("NEX_ATOMIC_FETCH_ADD_CHECK PASS old=%llu new=%llu\n",
+		       (unsigned long long)*atomic_result,
+		       (unsigned long long)*atomic_target);
+	}
+
+	success = true;
 	printf("✅ NEX RDMA provider test completed successfully!\n");
 	printf("   - Device: %s\n", ibv_get_device_name(dev));
+	printf("   - CQ API: %s\n", cfg.use_cq_ex ? "extended" : "legacy");
 	printf("   - QP Number: %d\n", qp->qp_num);
 	printf("   - Both send and recv completed.\n");
 	printf("   - Inline source reuse preserved the posted payload.\n");
@@ -515,5 +746,5 @@ cleanup_ctx:
 		ibv_close_device(ctx);
     ibv_free_device_list(dev_list);
 
-    return ret ? 1 : 0;
+	return success ? 0 : 1;
 }

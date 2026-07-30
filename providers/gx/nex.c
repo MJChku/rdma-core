@@ -104,6 +104,8 @@ enum nex_msg_opcode {
 	NEX_MSG_RDMA_READ_REQ = 4,
 	// RESP is only in NEX
 	NEX_MSG_RDMA_READ_RESP = 5,
+	NEX_MSG_ATOMIC_FETCH_ADD_REQ = 6,
+	NEX_MSG_ATOMIC_FETCH_ADD_RESP = 7,
 };
 
 enum nex_msg_status {
@@ -130,6 +132,7 @@ struct nex_msg_hdr {
 	uint32_t length;
 	uint32_t imm_data;
 	uint32_t reserved;
+	uint64_t atomic_operand;
 };
 
 struct nex_pending_msg {
@@ -364,7 +367,8 @@ static bool fiber_txq_try_pop(struct nex_qp *qp, struct nex_tx_wait_entry *out);
 static struct nex_mr *fiber_find_mr(struct nex_context *ctx, uint32_t rkey);
 static int nex_add_pending_read(struct nex_qp *qp, uint64_t wr_id,
 		      const struct ibv_sge *sg_list, int num_sge,
-		      size_t total_len, bool completion_requested);
+		      size_t total_len, bool completion_requested,
+		      enum ibv_wc_opcode wc_opcode);
 static struct nex_pending_read *nex_take_pending_read(struct nex_qp *qp,
 					       uint64_t wr_id);
 static struct ibv_mr *nex_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
@@ -479,7 +483,8 @@ static struct nex_mr *fiber_find_mr(struct nex_context *ctx, uint32_t rkey)
 
 static int nex_add_pending_read(struct nex_qp *qp, uint64_t wr_id,
               const struct ibv_sge *sg_list, int num_sge,
-              size_t total_len, bool completion_requested)
+              size_t total_len, bool completion_requested,
+              enum ibv_wc_opcode wc_opcode)
 {
     struct nex_pending_read *entry = calloc(1, sizeof(*entry));
     if (!entry) {
@@ -490,6 +495,7 @@ static int nex_add_pending_read(struct nex_qp *qp, uint64_t wr_id,
     entry->num_sge = num_sge;
     entry->total_len = total_len;
     entry->completion_requested = completion_requested;
+	entry->wc_opcode = wc_opcode;
     entry->next = NULL;
     for (int i = 0; i < num_sge; ++i)
         entry->sge[i] = sg_list[i];
@@ -529,6 +535,7 @@ static int fiber_send_msg(struct nex_qp *qp, struct nex_msg_hdr *hdr,
 			  int *out_slot)
 {
 	int rc = 0;
+	fiber_pthread_spin_lock(&qp->tx_wire_lock);
 	uint32_t tag = qp->next_tag;
 	qp->next_tag = (qp->next_tag % 0xFFFFu) + 1u;
 	// Use reserved header field to pass a unique tag to the network backend.
@@ -544,6 +551,7 @@ static int fiber_send_msg(struct nex_qp *qp, struct nex_msg_hdr *hdr,
 		*out_slot = -1;
 	}
 	NEX_TRACE("nex_send_msg sent payload");
+	fiber_pthread_spin_unlock(&qp->tx_wire_lock);
 	return rc;
 }
 
@@ -663,23 +671,41 @@ static void fiber_tx_send_worker(void *arg)
 						task->payload_iov, task->payload_iovcnt,
 						task->payload_len, task->wait_completion,
 						&tx_slot);
-			bool is_read_req = task->hdr.opcode == NEX_MSG_RDMA_READ_REQ;
+			bool response_owned_req =
+				task->hdr.opcode == NEX_MSG_RDMA_READ_REQ ||
+				task->hdr.opcode == NEX_MSG_ATOMIC_FETCH_ADD_REQ;
 			if (rc) {
 				/* Peer died mid-send: surface an error completion so the
 				 * consumer (e.g. NCCL's proxy) sees ncclRemoteError and can
 				 * abort, instead of crashing or hanging the process. */
-				struct ibv_wc err_wc = {
-					.wr_id = task->tx_wr_id,
-					.status = IBV_WC_RETRY_EXC_ERR,
-					.opcode = (task->hdr.opcode == NEX_MSG_RDMA_WRITE ||
-						   task->hdr.opcode == NEX_MSG_RDMA_WRITE_IMM)
-						  ? IBV_WC_RDMA_WRITE
-						  : IBV_WC_SEND,
-					.qp_num = qp->vqp.qp.qp_num,
-				};
-				if (task->wait_completion)
-					fiber_cq_push(qp->send_cq, &err_wc);
-			} else if (!is_read_req) {
+				if (response_owned_req) {
+					struct nex_pending_read *pending =
+						nex_take_pending_read(qp, task->tx_wr_id);
+					if (pending) {
+						struct ibv_wc err_wc = {
+							.wr_id = task->tx_wr_id,
+							.status = IBV_WC_RETRY_EXC_ERR,
+							.opcode = pending->wc_opcode,
+							.qp_num = qp->vqp.qp.qp_num,
+						};
+						fiber_cq_push(qp->send_cq, &err_wc);
+						free(pending);
+					}
+				} else {
+					struct ibv_wc err_wc = {
+						.wr_id = task->tx_wr_id,
+						.status = IBV_WC_RETRY_EXC_ERR,
+						.opcode =
+							(task->hdr.opcode == NEX_MSG_RDMA_WRITE ||
+							 task->hdr.opcode == NEX_MSG_RDMA_WRITE_IMM)
+								? IBV_WC_RDMA_WRITE
+								: IBV_WC_SEND,
+						.qp_num = qp->vqp.qp.qp_num,
+					};
+					if (task->wait_completion)
+						fiber_cq_push(qp->send_cq, &err_wc);
+				}
+			} else if (!response_owned_req) {
 				struct nex_tx_wait_entry entry = {
 					.wr_id = task->tx_wr_id,
 					.wc_op = (task->hdr.opcode == NEX_MSG_RDMA_WRITE ||
@@ -841,6 +867,7 @@ static int nex_query_device(struct ibv_context *context,
 	attr->orig_attr.max_qp_rd_atom = 1;
 	attr->orig_attr.max_res_rd_atom = 1;
 	attr->orig_attr.max_qp_init_rd_atom = 1;
+	attr->orig_attr.atomic_cap = IBV_ATOMIC_HCA;
 	attr->orig_attr.max_srq = 1024;
 	attr->orig_attr.max_srq_wr = 65536;
 	attr->orig_attr.max_srq_sge = 1;
@@ -1013,6 +1040,173 @@ static struct ibv_cq *nex_create_cq(struct ibv_context *context, int cqe,
 	return &cq->vcq.cq;
 }
 
+/*
+ * Extended CQ support is a view over the same completion ring used by
+ * ibv_poll_cq.  start_poll keeps the ring lock until end_poll, as required by
+ * the CQ_EX batch-poll contract, and current_wc owns the entry exposed through
+ * the read_* callbacks.
+ */
+static int nex_cq_ex_pop_locked(struct nex_cq *cq)
+{
+	struct ibv_cq_ex *cq_ex = &cq->vcq.cq_ex;
+
+	if (cq->head == cq->tail)
+		return ENOENT;
+
+	cq->current_wc = cq->entries[cq->head];
+	cq->head = (cq->head + 1) % cq->capacity;
+	cq_ex->status = cq->current_wc.status;
+	cq_ex->wr_id = cq->current_wc.wr_id;
+	return 0;
+}
+
+static int nex_cq_ex_start_poll(struct ibv_cq_ex *ibcq_ex,
+				struct ibv_poll_cq_attr *attr)
+{
+	struct nex_cq *cq = to_ncq(ibv_cq_ex_to_cq(ibcq_ex));
+	int ret;
+
+	if (attr && attr->comp_mask)
+		return EINVAL;
+
+	ret = pthread_spin_lock(&cq->lock);
+	if (ret)
+		return ret;
+
+	ret = nex_cq_ex_pop_locked(cq);
+	if (ret)
+		pthread_spin_unlock(&cq->lock);
+	return ret;
+}
+
+static int nex_cq_ex_next_poll(struct ibv_cq_ex *ibcq_ex)
+{
+	struct nex_cq *cq = to_ncq(ibv_cq_ex_to_cq(ibcq_ex));
+
+	return nex_cq_ex_pop_locked(cq);
+}
+
+static void nex_cq_ex_end_poll(struct ibv_cq_ex *ibcq_ex)
+{
+	struct nex_cq *cq = to_ncq(ibv_cq_ex_to_cq(ibcq_ex));
+
+	pthread_spin_unlock(&cq->lock);
+}
+
+static enum ibv_wc_opcode nex_cq_ex_read_opcode(struct ibv_cq_ex *ibcq_ex)
+{
+	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_wc.opcode;
+}
+
+static uint32_t nex_cq_ex_read_vendor_err(struct ibv_cq_ex *ibcq_ex)
+{
+	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_wc.vendor_err;
+}
+
+static uint32_t nex_cq_ex_read_byte_len(struct ibv_cq_ex *ibcq_ex)
+{
+	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_wc.byte_len;
+}
+
+static __be32 nex_cq_ex_read_imm_data(struct ibv_cq_ex *ibcq_ex)
+{
+	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_wc.imm_data;
+}
+
+static uint32_t nex_cq_ex_read_qp_num(struct ibv_cq_ex *ibcq_ex)
+{
+	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_wc.qp_num;
+}
+
+static uint32_t nex_cq_ex_read_src_qp(struct ibv_cq_ex *ibcq_ex)
+{
+	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_wc.src_qp;
+}
+
+static unsigned int nex_cq_ex_read_wc_flags(struct ibv_cq_ex *ibcq_ex)
+{
+	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_wc.wc_flags;
+}
+
+static uint32_t nex_cq_ex_read_slid(struct ibv_cq_ex *ibcq_ex)
+{
+	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_wc.slid;
+}
+
+static uint8_t nex_cq_ex_read_sl(struct ibv_cq_ex *ibcq_ex)
+{
+	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_wc.sl;
+}
+
+static uint8_t nex_cq_ex_read_dlid_path_bits(struct ibv_cq_ex *ibcq_ex)
+{
+	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_wc.dlid_path_bits;
+}
+
+static struct ibv_cq_ex *
+nex_create_cq_ex(struct ibv_context *context,
+		 struct ibv_cq_init_attr_ex *attr)
+{
+	const uint64_t supported_wc_flags = IBV_WC_STANDARD_FLAGS;
+	struct nex_context *ctx = to_nctx(context);
+	struct nex_cq *cq;
+	size_t ring_capacity;
+
+	if (!attr || attr->cqe == 0 || attr->comp_vector != 0) {
+		errno = EINVAL;
+		return NULL;
+	}
+	if (attr->comp_mask || attr->flags || attr->channel) {
+		errno = EOPNOTSUPP;
+		return NULL;
+	}
+	if (attr->wc_flags & ~supported_wc_flags) {
+		errno = EOPNOTSUPP;
+		return NULL;
+	}
+
+	cq = calloc(1, sizeof(*cq));
+	if (!cq)
+		return NULL;
+
+	ring_capacity = (size_t)attr->cqe + 1;
+	cq->entries = calloc(ring_capacity, sizeof(*cq->entries));
+	if (!cq->entries) {
+		free(cq);
+		return NULL;
+	}
+
+	cq->capacity = ring_capacity;
+	cq->head = cq->tail = 0;
+	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
+	cq->vcq.cq_ex.handle = nex_next_handle(ctx);
+	cq->vcq.cq_ex.cqe = attr->cqe;
+	cq->vcq.cq_ex.start_poll = nex_cq_ex_start_poll;
+	cq->vcq.cq_ex.next_poll = nex_cq_ex_next_poll;
+	cq->vcq.cq_ex.end_poll = nex_cq_ex_end_poll;
+	cq->vcq.cq_ex.read_opcode = nex_cq_ex_read_opcode;
+	cq->vcq.cq_ex.read_vendor_err = nex_cq_ex_read_vendor_err;
+	cq->vcq.cq_ex.read_wc_flags = nex_cq_ex_read_wc_flags;
+
+	if (attr->wc_flags & IBV_WC_EX_WITH_BYTE_LEN)
+		cq->vcq.cq_ex.read_byte_len = nex_cq_ex_read_byte_len;
+	if (attr->wc_flags & IBV_WC_EX_WITH_IMM)
+		cq->vcq.cq_ex.read_imm_data = nex_cq_ex_read_imm_data;
+	if (attr->wc_flags & IBV_WC_EX_WITH_QP_NUM)
+		cq->vcq.cq_ex.read_qp_num = nex_cq_ex_read_qp_num;
+	if (attr->wc_flags & IBV_WC_EX_WITH_SRC_QP)
+		cq->vcq.cq_ex.read_src_qp = nex_cq_ex_read_src_qp;
+	if (attr->wc_flags & IBV_WC_EX_WITH_SLID)
+		cq->vcq.cq_ex.read_slid = nex_cq_ex_read_slid;
+	if (attr->wc_flags & IBV_WC_EX_WITH_SL)
+		cq->vcq.cq_ex.read_sl = nex_cq_ex_read_sl;
+	if (attr->wc_flags & IBV_WC_EX_WITH_DLID_PATH_BITS)
+		cq->vcq.cq_ex.read_dlid_path_bits =
+			nex_cq_ex_read_dlid_path_bits;
+
+	return &cq->vcq.cq_ex;
+}
+
 static int nex_destroy_cq(struct ibv_cq *ibcq)
 {
 	struct nex_cq *cq = to_ncq(ibcq);
@@ -1142,6 +1336,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 	}
 	qp->tx_wait_head = qp->tx_wait_tail = 0;
 	pthread_spin_init(&qp->ex_lock, PTHREAD_PROCESS_PRIVATE);
+	pthread_spin_init(&qp->tx_wire_lock, PTHREAD_PROCESS_PRIVATE);
 
 	atomic_init(&qp->tx_running, false);
 	qp->next_tag = 1;
@@ -1174,6 +1369,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 		pthread_cond_destroy(&qp->state_cond);
 		pthread_spin_destroy(&qp->send_task_lock);
 		pthread_spin_destroy(&qp->ex_lock);
+		pthread_spin_destroy(&qp->tx_wire_lock);
 		free(qp->send_task_queue);
 		free(qp->tx_wait_queue);
 		pthread_mutex_destroy(&qp->vqp.qp.mutex);
@@ -1312,6 +1508,7 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 	qp->pending_head = qp->pending_tail = NULL;
 	pthread_spin_destroy(&qp->send_task_lock);
 	pthread_spin_destroy(&qp->ex_lock);
+	pthread_spin_destroy(&qp->tx_wire_lock);
 	free(qp->send_task_queue);
 	free(qp->tx_wait_queue);
 	free(qp->recv_queue);
@@ -1692,6 +1889,7 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			.length = (uint32_t)total_len,
 			.imm_data = 0,
 			.reserved = 0,
+			.atomic_operand = 0,
 		};
 
 		int rc = 0;
@@ -1714,7 +1912,7 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			hdr.rkey = wr->wr.rdma.rkey;
 			hdr.imm_data = wr->imm_data;
 			break;
-			case IBV_WR_RDMA_READ: {
+		case IBV_WR_RDMA_READ: {
 				hdr.opcode = NEX_MSG_RDMA_READ_REQ;
 				hdr.remote_addr = wr->wr.rdma.remote_addr;
 				hdr.rkey = wr->wr.rdma.rkey;
@@ -1736,7 +1934,8 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				/* Do not wait here; responder will wait on recv side. */
 
 			rc = nex_add_pending_read(qp, wr->wr_id, wr->sg_list,
-					wr->num_sge, total_len, completion_requested);
+					wr->num_sge, total_len, completion_requested,
+					IBV_WC_RDMA_READ);
 
 			/* READ request send does not generate a send-side completion. */
 			completion_requested = false;
@@ -1751,6 +1950,35 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				}
 				break;
 			}
+		case IBV_WR_ATOMIC_FETCH_AND_ADD:
+			if (wr->num_sge != 1 || total_len != sizeof(uint64_t) ||
+			    (wr->sg_list[0].addr & (sizeof(uint64_t) - 1)) != 0 ||
+			    (wr->wr.atomic.remote_addr & (sizeof(uint64_t) - 1)) != 0) {
+				if (bad_wr)
+					*bad_wr = wr;
+				errno = EINVAL;
+				NEX_ERROR("post_send fetch-add requires one aligned 8-byte SGE and remote address");
+				goto ERROR_OUT;
+			}
+			hdr.opcode = NEX_MSG_ATOMIC_FETCH_ADD_REQ;
+			hdr.remote_addr = wr->wr.atomic.remote_addr;
+			hdr.rkey = wr->wr.atomic.rkey;
+			hdr.length = sizeof(uint64_t);
+			hdr.atomic_operand = wr->wr.atomic.compare_add;
+			payload_len = 0;
+			rc = nex_add_pending_read(qp, wr->wr_id, wr->sg_list,
+					wr->num_sge, total_len, completion_requested,
+					IBV_WC_FETCH_ADD);
+			if (rc) {
+				if (bad_wr)
+					*bad_wr = wr;
+				errno = rc;
+				NEX_ERROR("post_send add_pending_fetch_add failed");
+				goto ERROR_OUT;
+			}
+			/* The response writes the fetched value and owns completion. */
+			completion_requested = false;
+			break;
 		default:
 			if (bad_wr)
 				*bad_wr = wr;
@@ -1824,7 +2052,8 @@ static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					wr->wr_id);
 					
 		if (rc) {
-			if (wr->opcode == IBV_WR_RDMA_READ) {
+			if (wr->opcode == IBV_WR_RDMA_READ ||
+			    wr->opcode == IBV_WR_ATOMIC_FETCH_AND_ADD) {
 				struct nex_pending_read *entry =
 				nex_take_pending_read(qp, wr->wr_id);
 				free(entry);
@@ -1979,6 +2208,32 @@ static void fiber_rx_fail_pending_recvs(struct nex_qp *qp)
 	}
 }
 
+/* READ and atomic WRs complete only after a response.  If the transport dies,
+ * detach every response-owned operation and report an error CQE (including
+ * unsignaled WRs, for which verbs still requires error reporting). */
+static void fiber_rx_fail_pending_rdma(struct nex_qp *qp)
+{
+	struct nex_pending_read *pending;
+
+	fiber_pthread_spin_lock(&qp->rdma_lock);
+	pending = qp->pending_reads;
+	qp->pending_reads = NULL;
+	fiber_pthread_spin_unlock(&qp->rdma_lock);
+
+	while (pending) {
+		struct nex_pending_read *next = pending->next;
+		struct ibv_wc wc = {
+			.wr_id = pending->wr_id,
+			.status = IBV_WC_RETRY_EXC_ERR,
+			.opcode = pending->wc_opcode,
+			.qp_num = qp->vqp.qp.qp_num,
+		};
+		fiber_cq_push(qp->send_cq, &wc);
+		free(pending);
+		pending = next;
+	}
+}
+
 static void fiber_rx_worker(void *arg)
 {
 
@@ -2013,8 +2268,10 @@ static void fiber_rx_worker(void *arg)
 			if (fiber_read_full(qp->rx_fd, &hdr, sizeof(hdr), 0)) {  // header: no perf model
 				/* Read failure with the QP still up = peer death (local
 				 * teardown clears rx_running first). Surface it. */
-				if (qp->rx_running)
+				if (qp->rx_running) {
 					fiber_rx_fail_pending_recvs(qp);
+					fiber_rx_fail_pending_rdma(qp);
+				}
 				break;
 			}
 
@@ -2074,7 +2331,6 @@ static void fiber_rx_worker(void *arg)
 		case NEX_MSG_RDMA_WRITE:
 		case NEX_MSG_RDMA_WRITE_IMM: {
 			int status = 0;
-			size_t copy_len = 0;
 			bool zero_len_imm = (hdr.opcode == NEX_MSG_RDMA_WRITE_IMM && hdr.length == 0);
 
 			/*
@@ -2133,35 +2389,25 @@ static void fiber_rx_worker(void *arg)
 					break;
 				}
 
-                if (!zero_len_imm) {
-                    if (hdr.length && entry_copy.sge.length) {
-                        size_t to_copy = hdr.length;
-                        if (to_copy > entry_copy.sge.length)
-                            to_copy = entry_copy.sge.length;
-                        struct iovec iov = {
-                            .iov_base = (void *)(uintptr_t)entry_copy.sge.addr,
-                            .iov_len  = to_copy,
-                        };
-						if (fiber_read_fullv(qp->rx_fd, &iov, 1, to_copy, 1, true, NULL, hdr.reserved) == 0)
-                            copy_len = to_copy;
+				/*
+				 * RDMA_WRITE_WITH_IMM consumes a receive WQE only to deliver
+				 * the immediate-data completion.  Its payload was already
+				 * streamed to hdr.remote_addr above; it is never copied into
+				 * the receive WQE's SGE.  Reading it again here consumes the
+				 * next wire header and corrupts framing.
+				 */
+				NEX_TRACE("RDMA_WRITE recved match wr_id=%" PRIu64
+					  " opcode=%u len=%u qp_pair=%u:%u",
+					  entry_copy.wr_id, hdr.opcode,
+					  zero_len_imm ? 0 : hdr.length,
+					  qp->vqp.qp.qp_num, qp->remote_qp_num);
 
-						NEX_TRACE("RDMA_WRITE recved match wr_id=%" PRIu64 " opcode=%u len=%u qp_pair=%u:%u",
-							entry_copy.wr_id, hdr.opcode, zero_len_imm ? 0 : hdr.length,
-							qp->vqp.qp.qp_num, qp->remote_qp_num);
-                    }
-                } else {
-                    copy_len = 0;
-                }
-
-				enum ibv_wc_status wc_status;
-				if (status != 0) {
-					wc_status = IBV_WC_REM_ACCESS_ERR;
-				} else if (!zero_len_imm &&
-							entry_copy.sge.length && hdr.length && copy_len != hdr.length) {
-					wc_status = IBV_WC_LOC_LEN_ERR;
-				} else {
-					wc_status = IBV_WC_SUCCESS;
-				}
+					enum ibv_wc_status wc_status;
+					if (status != 0) {
+						wc_status = IBV_WC_REM_ACCESS_ERR;
+					} else {
+						wc_status = IBV_WC_SUCCESS;
+					}
 
 				/* IB semantics: for RDMA_WRITE_WITH_IMM the consumed recv
 				 * completes with byte_len = length of the written payload,
@@ -2176,7 +2422,9 @@ static void fiber_rx_worker(void *arg)
 					.opcode   = IBV_WC_RECV_RDMA_WITH_IMM,
 					.byte_len = zero_len_imm ? 0 : hdr.length,
 					.qp_num   = qp->vqp.qp.qp_num,
+					.src_qp   = qp->remote_qp_num,
 					.imm_data = hdr.imm_data,
+					.wc_flags = IBV_WC_WITH_IMM,
 				};
 				fiber_cq_push(qp->recv_cq, &recv_wc);
             // No prefetch used; nothing to free
@@ -2237,14 +2485,22 @@ static void fiber_rx_worker(void *arg)
 				.iov_len = resp.length,
 			};
             int tx_slot = -1;
-            if (fiber_send_msg(qp, &resp,
+			if (fiber_send_msg(qp, &resp,
                              (resp.length && resp_buf) ? &resp_iov : NULL,
                              (resp.length && resp_buf) ? 1 : 0,
                              resp.length,
                              false,
-                             &tx_slot))
-                   NEX_TRACE("failed to send rdma_read_resp qp_pair=%u:%u",
-                           qp->vqp.qp.qp_num, qp->remote_qp_num);
+				     &tx_slot)) {
+				NEX_ERROR("failed to send rdma_read_resp qp_pair=%u:%u",
+					  qp->vqp.qp.qp_num, qp->remote_qp_num);
+				if (nex_use_tcp_backend())
+					nex_tcp_shutdown(qp->tx_fd);
+				else
+					nex_shm_shutdown(qp->tx_fd);
+				fiber_rx_fail_pending_recvs(qp);
+				fiber_rx_fail_pending_rdma(qp);
+				should_exit = true;
+			}
 			
 			NEX_TRACE("rdma_read_resp sent wr_id=%" PRIu64 " len=%u qp_pair=%u:%u",
 					   resp.wr_id, resp.length,
@@ -2266,7 +2522,7 @@ static void fiber_rx_worker(void *arg)
                 .wr_id = hdr.wr_id,
                 .status = (hdr.status == NEX_MSG_STATUS_OK) ?
                           IBV_WC_SUCCESS : IBV_WC_REM_ACCESS_ERR,
-                .opcode = IBV_WC_RDMA_READ,
+				.opcode = entry->wc_opcode,
                 .byte_len = hdr.length,
                 .qp_num = qp->vqp.qp.qp_num,
             };
@@ -2323,6 +2579,91 @@ static void fiber_rx_worker(void *arg)
             free(entry);
             break;
         }
+		case NEX_MSG_ATOMIC_FETCH_ADD_REQ: {
+			struct nex_msg_hdr resp = {
+				.opcode = NEX_MSG_ATOMIC_FETCH_ADD_RESP,
+				.status = NEX_MSG_STATUS_OK,
+				.wr_id = hdr.wr_id,
+				.length = sizeof(uint64_t),
+			};
+			uint64_t old_value = 0;
+			struct nex_mr *mr = fiber_find_mr(qp->ctx, hdr.rkey);
+			uintptr_t dest = (uintptr_t)hdr.remote_addr;
+			if (!mr || !(mr->vmr.access & IBV_ACCESS_REMOTE_ATOMIC)) {
+				resp.status = NEX_MSG_STATUS_REMOTE_ERROR;
+				resp.length = 0;
+			} else {
+				uintptr_t base = (uintptr_t)mr->vmr.ibv_mr.addr;
+				uintptr_t end = base + mr->vmr.ibv_mr.length;
+				if (end < base || dest < base || dest > end ||
+				    end - dest < sizeof(uint64_t) ||
+				    (dest & (sizeof(uint64_t) - 1)) != 0) {
+					resp.status = NEX_MSG_STATUS_REMOTE_ERROR;
+					resp.length = 0;
+				} else {
+					old_value = __atomic_fetch_add((uint64_t *)dest,
+							hdr.atomic_operand, __ATOMIC_SEQ_CST);
+				}
+			}
+
+			struct iovec resp_iov = {
+				.iov_base = &old_value,
+				.iov_len = resp.length,
+			};
+			int tx_slot = -1;
+			if (fiber_send_msg(qp, &resp,
+					   resp.length ? &resp_iov : NULL,
+					   resp.length ? 1 : 0, resp.length,
+					   true, &tx_slot)) {
+				NEX_ERROR("failed to send fetch-add response qp_pair=%u:%u",
+					  qp->vqp.qp.qp_num, qp->remote_qp_num);
+				if (nex_use_tcp_backend())
+					nex_tcp_shutdown(qp->tx_fd);
+				else
+					nex_shm_shutdown(qp->tx_fd);
+				fiber_rx_fail_pending_recvs(qp);
+				fiber_rx_fail_pending_rdma(qp);
+				should_exit = true;
+			}
+			break;
+		}
+		case NEX_MSG_ATOMIC_FETCH_ADD_RESP: {
+			struct nex_pending_read *entry =
+				nex_take_pending_read(qp, hdr.wr_id);
+			if (!entry) {
+				NEX_ERROR("fetch-add response with no pending operation wr_id=%" PRIu64,
+					  hdr.wr_id);
+				break;
+			}
+			struct ibv_wc atomic_wc = {
+				.wr_id = hdr.wr_id,
+				.status = hdr.status == NEX_MSG_STATUS_OK
+					? IBV_WC_SUCCESS : IBV_WC_REM_ACCESS_ERR,
+				.opcode = entry->wc_opcode,
+				.byte_len = hdr.length,
+				.qp_num = qp->vqp.qp.qp_num,
+			};
+			if (atomic_wc.status == IBV_WC_SUCCESS) {
+				if (entry->num_sge != 1 || entry->total_len != sizeof(uint64_t) ||
+				    hdr.length != sizeof(uint64_t)) {
+					atomic_wc.status = IBV_WC_LOC_LEN_ERR;
+				} else {
+					struct iovec iov = {
+						.iov_base = (void *)(uintptr_t)entry->sge[0].addr,
+						.iov_len = sizeof(uint64_t),
+					};
+					if (fiber_read_fullv(qp->rx_fd, &iov, 1,
+							    sizeof(uint64_t), 1, true, NULL,
+							    hdr.reserved) != 0)
+						atomic_wc.status = IBV_WC_REM_ACCESS_ERR;
+				}
+			}
+			if (entry->completion_requested ||
+			    atomic_wc.status != IBV_WC_SUCCESS)
+				fiber_cq_push(qp->send_cq, &atomic_wc);
+			free(entry);
+			break;
+		}
 		default:
 			   NEX_TRACE("unknown opcode %u qp_pair=%u:%u", hdr.opcode,
 				   qp->vqp.qp.qp_num, qp->remote_qp_num);
@@ -2546,6 +2887,7 @@ static const struct verbs_context_ops nex_ctx_ops = {
 	.reg_dmabuf_mr = nex_reg_dmabuf_mr,
 	.dereg_mr = nex_dereg_mr,
 	.create_cq = nex_create_cq,
+	.create_cq_ex = nex_create_cq_ex,
 	.destroy_cq = nex_destroy_cq,
 	.poll_cq = nex_poll_cq,
 	.req_notify_cq = nex_req_notify_cq,
