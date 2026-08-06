@@ -10,11 +10,13 @@
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -63,6 +65,25 @@ static uint64_t now_ns(void)
 #define NEX_INFO(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 
 #define NEX_ERROR(fmt, ...) fprintf(stderr, "ERROR: nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
+
+#define NEX_QP_REGISTRY_MAGIC 0x4e455851u
+#define NEX_QP_REGISTRY_VERSION 2u
+#define NEX_QP_REGISTRY_CAPACITY 65536u
+
+struct nex_qp_owner {
+	pid_t pid;
+	uint32_t qpn;
+	uint64_t start_time;
+	uint64_t cookie;
+};
+
+struct nex_qp_registry {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t capacity;
+	uint32_t reserved;
+	struct nex_qp_owner owners[NEX_QP_REGISTRY_CAPACITY];
+};
 
 static bool nex_trace_enabled(void)
 {
@@ -276,9 +297,53 @@ static int fiber_read_fullv(int fd, const struct iovec *iov, int iovcnt,
     return 0;
 }
 
+static uint64_t nex_process_start_time(pid_t pid)
+{
+	char path[64];
+	char stat_buf[4096];
+	snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+	FILE *file = fopen(path, "r");
+	if (!file)
+		return 0;
+	size_t len = fread(stat_buf, 1, sizeof(stat_buf) - 1, file);
+	fclose(file);
+	if (!len)
+		return 0;
+	stat_buf[len] = '\0';
+
+	/* The command in field 2 may contain spaces. Start after its final ')'. */
+	char *cursor = strrchr(stat_buf, ')');
+	if (!cursor || cursor[1] != ' ')
+		return 0;
+	cursor += 2;
+	for (int field = 3; field <= 22; ++field) {
+		while (*cursor == ' ')
+			++cursor;
+		if (!*cursor)
+			return 0;
+		char *end = cursor;
+		while (*end && *end != ' ')
+			++end;
+		if (field == 22)
+			return strtoull(cursor, NULL, 10);
+		cursor = end;
+	}
+	return 0;
+}
+
+static bool nex_qp_owner_alive(const struct nex_qp_owner *owner)
+{
+	if (owner->pid <= 0)
+		return false;
+	if (kill(owner->pid, 0) != 0 && errno != EPERM)
+		return false;
+	uint64_t start_time = nex_process_start_time(owner->pid);
+	return start_time != 0 && start_time == owner->start_time;
+}
+
 static int nex_map_qp_counter(struct nex_context *ctx)
 {
-	if (ctx->qp_counter)
+	if (ctx->qp_registry)
 		return 0;
 	int nex_id = get_nex_id();
 	char shm_name[128];
@@ -286,20 +351,36 @@ static int nex_map_qp_counter(struct nex_context *ctx)
 	int fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
 	if (fd < 0)
 		return -1;
-	if (ftruncate(fd, sizeof(uint32_t)) != 0) {
-		if (errno != EINVAL) {
-			close(fd);
-			return -1;
-		}
-	}
-	uint32_t *ptr = mmap(NULL, sizeof(uint32_t), PROT_READ | PROT_WRITE,
-			MAP_SHARED, fd, 0);
-	if (ptr == MAP_FAILED) {
+	size_t registry_size = sizeof(struct nex_qp_registry);
+	if (ftruncate(fd, registry_size) != 0) {
 		close(fd);
 		return -1;
 	}
+	struct nex_qp_registry *registry = mmap(NULL, registry_size,
+			PROT_READ | PROT_WRITE,
+			MAP_SHARED, fd, 0);
+	if (registry == MAP_FAILED) {
+		close(fd);
+		return -1;
+	}
+	if (flock(fd, LOCK_EX) != 0) {
+		munmap(registry, registry_size);
+		close(fd);
+		return -1;
+	}
+	if (registry->magic != NEX_QP_REGISTRY_MAGIC ||
+	    registry->version != NEX_QP_REGISTRY_VERSION ||
+	    registry->capacity != NEX_QP_REGISTRY_CAPACITY) {
+		memset(registry, 0, registry_size);
+		registry->version = NEX_QP_REGISTRY_VERSION;
+		registry->capacity = NEX_QP_REGISTRY_CAPACITY;
+		__sync_synchronize();
+		registry->magic = NEX_QP_REGISTRY_MAGIC;
+	}
+	flock(fd, LOCK_UN);
 	ctx->qp_counter_fd = fd;
-	ctx->qp_counter = ptr;
+	ctx->qp_registry = registry;
+	ctx->qp_registry_size = registry_size;
 	return 0;
 }
 
@@ -872,6 +953,34 @@ static int nex_query_device(struct ibv_context *context,
 	attr->orig_attr.max_srq_wr = 65536;
 	attr->orig_attr.max_srq_sge = 1;
 	attr->orig_attr.phys_port_cnt = 1;
+	/* ibv_query_device() also reaches this callback with only orig_attr-sized
+	 * storage.  Populate extended clock fields only for a full-enough
+	 * ibv_query_device_ex() result. */
+	if (attr_size >= offsetof(struct ibv_device_attr_ex, hca_core_clock) +
+			 sizeof(attr->hca_core_clock)) {
+		attr->completion_timestamp_mask = UINT64_MAX;
+		attr->hca_core_clock = 1000000000ull;
+	}
+
+	return 0;
+}
+
+static int nex_query_rt_values(struct ibv_context *context,
+			       struct ibv_values_ex *values)
+{
+	(void)context;
+
+	if (!values ||
+	    (values->comp_mask & ~IBV_VALUES_MASK_RAW_CLOCK))
+		return EINVAL;
+
+	if (values->comp_mask & IBV_VALUES_MASK_RAW_CLOCK) {
+		if (clock_gettime(CLOCK_MONOTONIC, &values->raw_clock))
+			return errno;
+		values->comp_mask = IBV_VALUES_MASK_RAW_CLOCK;
+	} else {
+		values->comp_mask = 0;
+	}
 
 	return 0;
 }
@@ -1054,6 +1163,7 @@ static int nex_cq_ex_pop_locked(struct nex_cq *cq)
 		return ENOENT;
 
 	cq->current_wc = cq->entries[cq->head];
+	cq->current_timestamp = now_ns();
 	cq->head = (cq->head + 1) % cq->capacity;
 	cq_ex->status = cq->current_wc.status;
 	cq_ex->wr_id = cq->current_wc.wr_id;
@@ -1143,11 +1253,21 @@ static uint8_t nex_cq_ex_read_dlid_path_bits(struct ibv_cq_ex *ibcq_ex)
 	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_wc.dlid_path_bits;
 }
 
+static uint64_t nex_cq_ex_read_completion_ts(struct ibv_cq_ex *ibcq_ex)
+{
+	return to_ncq(ibv_cq_ex_to_cq(ibcq_ex))->current_timestamp;
+}
+
 static struct ibv_cq_ex *
 nex_create_cq_ex(struct ibv_context *context,
 		 struct ibv_cq_init_attr_ex *attr)
 {
-	const uint64_t supported_wc_flags = IBV_WC_STANDARD_FLAGS;
+	const uint64_t supported_wc_flags = IBV_WC_STANDARD_FLAGS |
+		IBV_WC_EX_WITH_COMPLETION_TIMESTAMP;
+	const uint32_t supported_comp_mask = IBV_CQ_INIT_ATTR_MASK_FLAGS;
+	const uint32_t supported_create_flags =
+		IBV_CREATE_CQ_ATTR_SINGLE_THREADED |
+		IBV_CREATE_CQ_ATTR_IGNORE_OVERRUN;
 	struct nex_context *ctx = to_nctx(context);
 	struct nex_cq *cq;
 	size_t ring_capacity;
@@ -1156,7 +1276,12 @@ nex_create_cq_ex(struct ibv_context *context,
 		errno = EINVAL;
 		return NULL;
 	}
-	if (attr->comp_mask || attr->flags || attr->channel) {
+	if ((attr->comp_mask & ~supported_comp_mask) || attr->channel) {
+		errno = EOPNOTSUPP;
+		return NULL;
+	}
+	if ((attr->comp_mask & IBV_CQ_INIT_ATTR_MASK_FLAGS) &&
+	    (attr->flags & ~supported_create_flags)) {
 		errno = EOPNOTSUPP;
 		return NULL;
 	}
@@ -1203,6 +1328,9 @@ nex_create_cq_ex(struct ibv_context *context,
 	if (attr->wc_flags & IBV_WC_EX_WITH_DLID_PATH_BITS)
 		cq->vcq.cq_ex.read_dlid_path_bits =
 			nex_cq_ex_read_dlid_path_bits;
+	if (attr->wc_flags & IBV_WC_EX_WITH_COMPLETION_TIMESTAMP)
+		cq->vcq.cq_ex.read_completion_ts =
+			nex_cq_ex_read_completion_ts;
 
 	return &cq->vcq.cq_ex;
 }
@@ -1213,6 +1341,20 @@ static int nex_destroy_cq(struct ibv_cq *ibcq)
 	pthread_spin_destroy(&cq->lock);
 	free(cq->entries);
 	free(cq);
+	return 0;
+}
+
+static int nex_modify_cq(struct ibv_cq *ibcq,
+			 struct ibv_modify_cq_attr *attr)
+{
+	(void)ibcq;
+
+	if (!attr || attr->attr_mask != IBV_CQ_ATTR_MODERATE)
+		return EINVAL;
+
+	/* GX completions are delivered by a software queue and have no interrupt
+	 * coalescer.  Accept the standard moderation request as a semantic no-op;
+	 * polling and completion ordering remain unchanged. */
 	return 0;
 }
 
@@ -1419,7 +1561,6 @@ static struct ibv_qp *nex_create_qp_ex(struct ibv_context *context,
 static int nex_destroy_qp(struct ibv_qp *ibqp)
 {
 	struct nex_qp *qp = to_nqp(ibqp);
-	nex_qp_release(qp);
 
 	pthread_mutex_lock(&qp->state_lock);
 	qp->destroying = true;
@@ -1512,6 +1653,7 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 	free(qp->send_task_queue);
 	free(qp->tx_wait_queue);
 	free(qp->recv_queue);
+	nex_qp_release(qp);
 	free(qp);
 	return 0;
 }
@@ -2809,30 +2951,118 @@ shm_worker_fail:
 /* Global QP reservation (per device; cross processes) -------------------------------- */
 static int nex_qp_reserve(struct nex_qp *qp)
 {
-    struct nex_context *ctx = qp->ctx;
+	struct nex_context *ctx = qp->ctx;
+	qp->qp_counter_slot = UINT32_MAX;
 
-    if (!ctx->qp_counter && nex_map_qp_counter(ctx) != 0)
-        return 0; /* best effort if shared counter unavailable */
+	if (!ctx->qp_registry && nex_map_qp_counter(ctx) != 0)
+		return 0; /* best effort if shared counter unavailable */
 
-    if (!ctx->qp_counter)
-        return 0;
+	if (!ctx->qp_registry)
+		return 0;
+	if (flock(ctx->qp_counter_fd, LOCK_EX) != 0)
+		return 0;
 
-    uint32_t new = __sync_add_and_fetch(ctx->qp_counter, 1);
-    uint32_t limit = ctx->qp_limit ? ctx->qp_limit : NEX_DEFAULT_MAX_QP;
-    if (new > limit) {
-		NEX_ERROR("QP limit exceeded (%u) new=%u", limit, new);
-        __sync_sub_and_fetch(ctx->qp_counter, 1);
-        errno = ENOSPC;
-        return -1;
-    }
-    return 0;
+	struct nex_qp_registry *registry = ctx->qp_registry;
+	uint32_t active = registry->reserved;
+	uint32_t reclaimed = 0;
+	uint32_t free_slot = UINT32_MAX;
+	uint32_t limit = ctx->qp_limit ? ctx->qp_limit : NEX_DEFAULT_MAX_QP;
+	if (limit > registry->capacity)
+		limit = registry->capacity;
+
+	/* Normal creation is cheap. Only inspect /proc when stale reservations
+	 * could prevent an allocation; process exits then become self-healing. */
+	if (active >= limit) {
+		active = 0;
+		for (uint32_t i = 0; i < registry->capacity; ++i) {
+			struct nex_qp_owner *owner = &registry->owners[i];
+			if (owner->pid && !nex_qp_owner_alive(owner)) {
+				memset(owner, 0, sizeof(*owner));
+				++reclaimed;
+			}
+			if (owner->pid)
+				++active;
+		}
+		registry->reserved = active;
+	}
+	if (active >= limit || free_slot == UINT32_MAX) {
+		for (uint32_t i = 0; i < registry->capacity; ++i) {
+			if (!registry->owners[i].pid) {
+				free_slot = i;
+				break;
+			}
+		}
+	}
+	if (active >= limit || free_slot == UINT32_MAX) {
+		flock(ctx->qp_counter_fd, LOCK_UN);
+		NEX_ERROR("QP limit exceeded (%u) active=%u requested=%u reclaimed=%u",
+			  limit, active, active + 1, reclaimed);
+		errno = ENOSPC;
+		return -1;
+	}
+	registry->owners[free_slot] = (struct nex_qp_owner) {
+		.pid = ctx->qp_owner_pid,
+		.qpn = qp->vqp.qp.qp_num,
+		.start_time = ctx->qp_owner_start_time,
+		.cookie = ctx->qp_owner_cookie,
+	};
+	registry->reserved = active + 1;
+	qp->qp_counter_slot = free_slot;
+	flock(ctx->qp_counter_fd, LOCK_UN);
+	if (reclaimed)
+		NEX_INFO("QP_OWNER_CLEANUP pid=%ld released=%u active=%u",
+			 (long)ctx->qp_owner_pid, reclaimed, active);
+	NEX_TRACE("QP_CREATE pid=%ld qpn=%u slot=%u active=%u",
+		  (long)ctx->qp_owner_pid, qp->vqp.qp.qp_num, free_slot,
+		  active + 1);
+	return 0;
 }
 
 static void nex_qp_release(struct nex_qp *qp)
 {
-    struct nex_context *ctx = qp->ctx;
-    if (ctx->qp_counter)
-        __sync_sub_and_fetch(ctx->qp_counter, 1);
+	struct nex_context *ctx = qp->ctx;
+	if (!ctx->qp_registry || qp->qp_counter_slot == UINT32_MAX)
+		return;
+	if (flock(ctx->qp_counter_fd, LOCK_EX) != 0)
+		return;
+	uint32_t slot = qp->qp_counter_slot;
+	struct nex_qp_owner *owner = &ctx->qp_registry->owners[slot];
+	if (owner->pid == ctx->qp_owner_pid &&
+	    owner->start_time == ctx->qp_owner_start_time &&
+	    owner->cookie == ctx->qp_owner_cookie &&
+	    owner->qpn == qp->vqp.qp.qp_num) {
+		memset(owner, 0, sizeof(*owner));
+		if (ctx->qp_registry->reserved)
+			--ctx->qp_registry->reserved;
+	}
+	qp->qp_counter_slot = UINT32_MAX;
+	flock(ctx->qp_counter_fd, LOCK_UN);
+	NEX_TRACE("QP_DESTROY pid=%ld qpn=%u slot=%u",
+		  (long)ctx->qp_owner_pid, qp->vqp.qp.qp_num, slot);
+}
+
+static void nex_qp_release_context(struct nex_context *ctx)
+{
+	if (!ctx->qp_registry || flock(ctx->qp_counter_fd, LOCK_EX) != 0)
+		return;
+	uint32_t released = 0;
+	for (uint32_t i = 0; i < ctx->qp_registry->capacity; ++i) {
+		struct nex_qp_owner *owner = &ctx->qp_registry->owners[i];
+		if (owner->pid == ctx->qp_owner_pid &&
+		    owner->start_time == ctx->qp_owner_start_time &&
+		    owner->cookie == ctx->qp_owner_cookie) {
+			memset(owner, 0, sizeof(*owner));
+			++released;
+		}
+	}
+	if (released >= ctx->qp_registry->reserved)
+		ctx->qp_registry->reserved = 0;
+	else
+		ctx->qp_registry->reserved -= released;
+	flock(ctx->qp_counter_fd, LOCK_UN);
+	if (released)
+		NEX_INFO("QP_CONTEXT_CLEANUP pid=%ld released=%u",
+			 (long)ctx->qp_owner_pid, released);
 }
 
 /* Address handle stubs -------------------------------------------------- */
@@ -2855,9 +3085,10 @@ static int nex_destroy_ah(struct ibv_ah *ah)
 static void nex_free_context(struct ibv_context *ibctx)
 {
 	struct nex_context *ctx = to_nctx(ibctx);
-	if (ctx->qp_counter) {
-		munmap(ctx->qp_counter, sizeof(uint32_t));
-		ctx->qp_counter = NULL;
+	nex_qp_release_context(ctx);
+	if (ctx->qp_registry) {
+		munmap(ctx->qp_registry, ctx->qp_registry_size);
+		ctx->qp_registry = NULL;
 	}
 	if (ctx->qp_counter_fd >= 0) {
 		close(ctx->qp_counter_fd);
@@ -2880,6 +3111,7 @@ static void nex_free_context(struct ibv_context *ibctx)
 
 static const struct verbs_context_ops nex_ctx_ops = {
 	.query_device_ex = nex_query_device,
+	.query_rt_values = nex_query_rt_values,
 	.query_port = nex_query_port,
 	.alloc_pd = nex_alloc_pd,
 	.dealloc_pd = nex_dealloc_pd,
@@ -2889,6 +3121,7 @@ static const struct verbs_context_ops nex_ctx_ops = {
 	.create_cq = nex_create_cq,
 	.create_cq_ex = nex_create_cq_ex,
 	.destroy_cq = nex_destroy_cq,
+	.modify_cq = nex_modify_cq,
 	.poll_cq = nex_poll_cq,
 	.req_notify_cq = nex_req_notify_cq,
 	.create_srq = nex_create_srq,
@@ -2961,8 +3194,13 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
 	atomic_init(&ctx->next_key, 1);
 	atomic_init(&ctx->next_port, 0);
     ctx->qp_counter_fd = -1;
-    ctx->qp_counter = NULL;
-    ctx->qp_limit = NEX_DEFAULT_MAX_QP;
+	ctx->qp_registry = NULL;
+	ctx->qp_registry_size = 0;
+	ctx->qp_limit = NEX_DEFAULT_MAX_QP;
+	ctx->qp_owner_pid = getpid();
+	ctx->qp_owner_start_time = nex_process_start_time(ctx->qp_owner_pid);
+	ctx->qp_owner_cookie = now_ns() ^ (uint64_t)(uintptr_t)ctx ^
+				      (uint64_t)ctx->qp_owner_pid;
     pthread_spin_init(&ctx->mr_lock, PTHREAD_PROCESS_PRIVATE);
     ctx->mr_list = NULL;
     const char *env_limit = getenv("GX_MAX_QP");

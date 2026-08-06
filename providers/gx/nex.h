@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
+#include <sys/types.h>
 
 #define NEX_MAX_SGE           8
 #define NEX_MAX_INLINE_DATA   256
@@ -20,15 +21,20 @@ struct nex_device {
 };
 
 struct nex_mr;
+struct nex_qp_registry;
 
 struct nex_context {
 	struct verbs_context ibv_ctx;
 	atomic_uint next_handle;
 	atomic_uint next_key;
 	atomic_uint next_port;
-    int qp_counter_fd;
-    uint32_t *qp_counter;
-    uint32_t qp_limit;
+	int qp_counter_fd;
+	struct nex_qp_registry *qp_registry;
+	size_t qp_registry_size;
+	uint32_t qp_limit;
+	pid_t qp_owner_pid;
+	uint64_t qp_owner_start_time;
+	uint64_t qp_owner_cookie;
     pthread_spinlock_t mr_lock;
     struct nex_mr *mr_list;
 	int gid;
@@ -44,6 +50,7 @@ struct nex_cq {
 	struct ibv_wc *entries;
 	/* Current entry exposed through ibv_cq_ex while start_poll holds lock. */
 	struct ibv_wc current_wc;
+	uint64_t current_timestamp;
 	uint32_t capacity;
 	uint32_t head;
 	uint32_t tail;
@@ -92,6 +99,7 @@ struct nex_qp {
 	struct nex_context *ctx;
 	struct nex_cq *send_cq;
 	struct nex_cq *recv_cq;
+	uint32_t qp_counter_slot;
 	pthread_spinlock_t lock;
 	pthread_cond_t recv_cond;
 	struct nex_recv_entry *recv_queue;

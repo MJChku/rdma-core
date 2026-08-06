@@ -281,6 +281,11 @@ static int poll_completions(struct ibv_cq *cq, struct ibv_cq_ex *cq_ex,
 		entry->src_qp = ibv_wc_read_src_qp(cq_ex);
 		entry->wc_flags = ibv_wc_read_wc_flags(cq_ex);
 		entry->sl = ibv_wc_read_sl(cq_ex);
+		if (!ibv_wc_read_completion_ts(cq_ex)) {
+			ibv_end_poll(cq_ex);
+			errno = EIO;
+			return -1;
+		}
 
 		if (count == max_entries)
 			break;
@@ -392,6 +397,18 @@ int main(int argc, char *argv[])
 		ibv_free_device_list(dev_list);
 		return 1;
 	}
+	if (cfg.use_cq_ex) {
+		struct ibv_values_ex values = {
+			.comp_mask = IBV_VALUES_MASK_RAW_CLOCK,
+		};
+		if (ibv_query_rt_values_ex(ctx, &values) ||
+		    !(values.comp_mask & IBV_VALUES_MASK_RAW_CLOCK) ||
+		    (values.raw_clock.tv_sec == 0 && values.raw_clock.tv_nsec == 0)) {
+			fprintf(stderr, "extended CQ raw clock query failed\n");
+			ret = 1;
+			goto cleanup_ctx;
+		}
+	}
 	struct ibv_port_attr port_attr = {};
 	if (ibv_query_port(ctx, 1, &port_attr)) {
 		perror("ibv_query_port");
@@ -436,7 +453,11 @@ int main(int argc, char *argv[])
 				    IBV_WC_EX_WITH_IMM |
 				    IBV_WC_EX_WITH_QP_NUM |
 				    IBV_WC_EX_WITH_SRC_QP |
-				    IBV_WC_EX_WITH_SL,
+				    IBV_WC_EX_WITH_SL |
+				    IBV_WC_EX_WITH_COMPLETION_TIMESTAMP,
+			.comp_mask = IBV_CQ_INIT_ATTR_MASK_FLAGS,
+			.flags = IBV_CREATE_CQ_ATTR_SINGLE_THREADED |
+				 IBV_CREATE_CQ_ATTR_IGNORE_OVERRUN,
 		};
 		cq_ex = ibv_create_cq_ex(ctx, &cq_attr);
 		cq = cq_ex ? ibv_cq_ex_to_cq(cq_ex) : NULL;
@@ -448,6 +469,20 @@ int main(int argc, char *argv[])
 		       "Failed to create CQ");
 		ret = 1;
 		goto cleanup_mr;
+	}
+	if (cfg.use_cq_ex) {
+		struct ibv_modify_cq_attr modify_attr = {
+			.attr_mask = IBV_CQ_ATTR_MODERATE,
+			.moderate = {
+				.cq_count = 16,
+				.cq_period = 10,
+			},
+		};
+		if (ibv_modify_cq(cq, &modify_attr)) {
+			fprintf(stderr, "extended CQ moderation request failed\n");
+			ret = 1;
+			goto cleanup_cq;
+		}
 	}
 	if (cfg.cq_ex_create_only) {
 		struct ibv_wc empty_wc = {};

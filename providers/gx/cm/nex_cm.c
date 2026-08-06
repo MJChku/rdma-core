@@ -5,19 +5,20 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #define NEX_CM_DEFAULT_SERVICE_HOST "gx-mpi-0"
 #define NEX_CM_DEFAULT_SERVICE_PORT "5690"
 #define NEX_CM_TARGET_NOFILE 131072
+#define NEX_CM_LISTEN_ACK 0xa5
 
 struct nex_cm_req {
 	char service_id[64];
@@ -81,15 +82,19 @@ static int set_nonblocking(int fd)
 static int wait_writable_nb(int fd)
 {
 	for (;;) {
-		fd_set wfds;
-		struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
-		FD_ZERO(&wfds);
-		FD_SET(fd, &wfds);
-		int rc = select(fd + 1, NULL, &wfds, NULL, &tv);
+		struct pollfd pfd = {
+			.fd = fd,
+			.events = POLLOUT,
+		};
+		int rc = poll(&pfd, 1, 0);
 		if (rc > 0)
 			return 0;
 		if (rc < 0 && errno != EINTR)
 			return -1;
+		if (rc > 0 && (pfd.revents & POLLNVAL)) {
+			errno = EBADF;
+			return -1;
+		}
 		cm_idle_yield();
 	}
 }
@@ -268,6 +273,18 @@ int nex_cm_exchange(const char *service_id,
 		err = errno ? errno : EIO;
 		fprintf(stderr, "nex_cm: recv_all FAILED err=%d\n", err);
 		goto out;
+	}
+	/* The server must know that the peer which waited in its pending table is
+	 * still alive before it releases the newly connecting peer.  Without this
+	 * acknowledgement, a late TCP reset can make a fresh connection pair with
+	 * a stale waiter even when a pre-send liveness probe looked healthy. */
+	if (rsp.role == NEX_CM_ROLE_LISTEN) {
+		const uint8_t ack = NEX_CM_LISTEN_ACK;
+		if (send_all(fd, &ack, sizeof(ack))) {
+			err = errno ? errno : EIO;
+			fprintf(stderr, "nex_cm: pending-peer ack FAILED err=%d\n", err);
+			goto out;
+		}
 	}
 
 	peer->qp_num = ntohl(rsp.peer_qp_num);

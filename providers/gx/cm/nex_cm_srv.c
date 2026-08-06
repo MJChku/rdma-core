@@ -17,6 +17,7 @@
 #define CM_LISTEN_BACKLOG 8192
 #define CM_TARGET_NOFILE 131072
 #define CM_PENDING_BUCKETS 4096
+#define NEX_CM_LISTEN_ACK 0xa5
 
 struct nex_cm_req {
 	char service_id[64];
@@ -255,8 +256,18 @@ static void serve(int listen_fd)
 			.role = NEX_CM_ROLE_LISTEN,
 		};
 		strncpy(rsp_listen.peer_host, connect_host, sizeof(rsp_listen.peer_host) - 1);
-		if (send_all(match->sock, &rsp_listen, sizeof(rsp_listen)) != 0) {
-			perror("send pending peer");
+		uint8_t listen_ack = 0;
+		int pending_ok = send_all(match->sock, &rsp_listen,
+					  sizeof(rsp_listen));
+		if (pending_ok == 0)
+			pending_ok = recv_all(match->sock, &listen_ack,
+					      sizeof(listen_ack));
+		if (pending_ok == 0 && listen_ack != NEX_CM_LISTEN_ACK) {
+			errno = EPROTO;
+			pending_ok = -1;
+		}
+		if (pending_ok != 0) {
+			perror("pending peer acknowledgement");
 			close(match->sock);
 			free(match);
 
