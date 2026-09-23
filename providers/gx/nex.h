@@ -103,7 +103,9 @@ struct nex_qp {
 	bool sq_sig_all;
 	uint8_t *send_buf;
 	size_t send_buf_capacity;
-	pthread_spinlock_t rdma_lock;
+	/* Shared with the application pthread. A native RX worker must actually
+	 * block here so GXVM can withdraw its membership while the owner runs. */
+	pthread_mutex_t rdma_lock;
 	struct nex_pending_read *pending_reads;
 	pthread_mutex_t state_lock;
 	pthread_cond_t state_cond;

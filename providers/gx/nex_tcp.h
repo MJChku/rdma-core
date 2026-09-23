@@ -17,3 +17,7 @@ ssize_t nex_tcp_readv(int fd, const struct iovec *iov, int iovcnt,
                       uint32_t tag);
 int nex_tcp_close(int fd);
 int nex_tcp_shutdown(int fd);
+int nex_tcp_message_begin(int fd, size_t payload_bytes);
+void nex_tcp_message_end(int fd);
+uint64_t nex_tcp_completion_time(int fd, bool acknowledged);
+void nex_tcp_wait_until(int fd, uint64_t time_ns);

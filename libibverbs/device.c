@@ -252,7 +252,7 @@ int verbs_init_context(struct verbs_context *context_ex,
 
 	context_ex->priv->driver_id = driver_id;
 	verbs_set_ops(context_ex, &verbs_dummy_ops);
-	context_ex->priv->use_ioctl_write = has_ioctl_write(context);
+	context_ex->priv->use_ioctl_write = cmd_fd >= 0 && has_ioctl_write(context);
 
 	return 0;
 }
@@ -327,7 +327,7 @@ struct ibv_context *verbs_open_device(struct ibv_device *device, void *private_d
 	struct verbs_context *context_ex;
 	int ret;
 
-	if (verbs_device->sysfs) {
+	if (verbs_device->sysfs && !(verbs_device->sysfs->flags & VSYSFS_USERSPACE)) {
 		/*
 		 * We'll only be doing writes, but we need O_RDWR in case the
 		 * provider needs to mmap() the file.

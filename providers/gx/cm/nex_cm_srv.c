@@ -245,6 +245,17 @@ static void serve(int listen_fd)
 int main(void)
 {
 	raise_nofile_best_effort();
+	unsigned port = CM_LISTEN_PORT;
+	const char *port_env = getenv("GX_CM_SERVICE_PORT");
+	if (port_env && *port_env) {
+		char *end;
+		unsigned long parsed = strtoul(port_env, &end, 10);
+		if (*end || parsed == 0 || parsed > 65535) {
+			fprintf(stderr, "invalid GX_CM_SERVICE_PORT\n");
+			return 1;
+		}
+		port = parsed;
+	}
 
 	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (listen_fd < 0) {
@@ -257,7 +268,7 @@ int main(void)
 	struct sockaddr_in addr = {
 		.sin_family = AF_INET,
 		.sin_addr.s_addr = htonl(INADDR_ANY),
-		.sin_port = htons(CM_LISTEN_PORT),
+		.sin_port = htons(port),
 	};
 	if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		perror("bind");
@@ -270,7 +281,7 @@ int main(void)
 		return 1;
 	}
 	printf("gx_cm_srv listening on port %d (backlog=%d)\n",
-	       CM_LISTEN_PORT, CM_LISTEN_BACKLOG);
+	       port, CM_LISTEN_BACKLOG);
 	serve(listen_fd);
 	close(listen_fd);
 	return 0;

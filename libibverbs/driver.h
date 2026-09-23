@@ -269,6 +269,8 @@ struct verbs_match_ent {
 enum {
 	VSYSFS_READ_MODALIAS = 1 << 0,
 	VSYSFS_READ_NODE_GUID = 1 << 1,
+	/* GX's software provider has no kernel uverbs device. */
+	VSYSFS_USERSPACE = 1 << 2,
 };
 
 /* An rdma device detected in sysfs */

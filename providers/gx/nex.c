@@ -28,10 +28,35 @@
 #include "nex.h"
 #include "nex_shm.h"
 #include "nex_tcp.h"
+#include "nex_simbricks.h"
 #include "cm/nex_cm.h"
 
 static int get_nex_id(void);
 static bool nex_use_tcp_backend(void);
+
+/* Provider bookkeeping is emulator work, not the application's real verbs
+ * implementation. Compress its CPU cost without leaving epoch membership.
+ * Apply once at public verbs entries, including early/error returns. Nested
+ * calls preserve the caller's factor; the native NIC workers are unaffected. */
+static const float nex_cpu_compression = 30.0f;
+
+static float nex_cpu_scope_begin(void)
+{
+    float previous = accvm_syms.compression_factor();
+    if (previous < nex_cpu_compression)
+        accvm_syms.compress_time(nex_cpu_compression);
+    return previous;
+}
+
+static void nex_cpu_scope_end(float *previous)
+{
+    if (*previous < nex_cpu_compression)
+        accvm_syms.compress_time(*previous);
+}
+
+#define NEX_CPU_SCOPE \
+    float nex_cpu_previous __attribute__((cleanup(nex_cpu_scope_end))) = \
+        nex_cpu_scope_begin()
 
 static bool nex_use_tcp_backend(void)
 {
@@ -46,6 +71,7 @@ static bool nex_use_tcp_backend(void)
 		if (backend && strcmp(backend, "tcp") == 0) {
 			use_tcp = true;
 		}
+		if (gx_nic_enabled()) use_tcp = true;
 		initialized = 1;
 	}
 
@@ -60,13 +86,11 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-#define DEBUG
-
 #define NEX_INFO(fmt, ...) fprintf(stderr, "nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 
 #define NEX_ERROR(fmt, ...) fprintf(stderr, "ERROR: nex (%d, %lu us): " fmt "\n", get_nex_id(), now_ns() / 1000, ##__VA_ARGS__)
 
-#ifdef DEBUG
+#ifndef NDEBUG
 #define NEX_TRACE(fmt, ...) fprintf(stderr, "nex (%d, %lu ns): " fmt "\n", get_nex_id(), now_ns(), ##__VA_ARGS__)
 #else
 #define NEX_TRACE(fmt, ...) do { } while (0)
@@ -188,7 +212,10 @@ static inline void fiber_pthread_spin_lock(pthread_spinlock_t *lock)
 		if (rc == 0)
 			return;
 		assert(rc == EBUSY);
-		gx_fiber_yield();
+		/* The owner may be an application pthread waiting for this model
+		 * at an epoch boundary. A failed lock attempt is idle, not NIC work;
+		 * let the all-idle hook complete the epoch so that owner can run. */
+		gx_fiber_idle_yield();
 	}
 }
 
@@ -441,6 +468,7 @@ struct nex_send_task {
 
 struct nex_tx_wait_entry {
 	uint64_t wr_id;
+	uint64_t ready_ns;
 	enum ibv_wc_opcode wc_op;
 	uint32_t byte_len;
 	int slot;
@@ -485,7 +513,7 @@ static int nex_add_pending_read(struct nex_qp *qp, uint64_t wr_id,
     entry->next = NULL;
     for (int i = 0; i < num_sge; ++i)
         entry->sge[i] = sg_list[i];
-    fiber_pthread_spin_lock(&qp->rdma_lock);
+    pthread_mutex_lock(&qp->rdma_lock);
     /* Add to tail for FIFO ordering */
     if (!qp->pending_reads) {
         qp->pending_reads = entry;
@@ -495,14 +523,14 @@ static int nex_add_pending_read(struct nex_qp *qp, uint64_t wr_id,
             tail = tail->next;
         tail->next = entry;
     }
-    fiber_pthread_spin_unlock(&qp->rdma_lock);
+    pthread_mutex_unlock(&qp->rdma_lock);
     return 0;
 }
 
 static struct nex_pending_read *nex_take_pending_read(struct nex_qp *qp, uint64_t wr_id)
 {
 	struct nex_pending_read *entry = NULL;
-	fiber_pthread_spin_lock(&qp->rdma_lock);
+	pthread_mutex_lock(&qp->rdma_lock);
 	struct nex_pending_read **prev = &qp->pending_reads;
 	while (*prev && (*prev)->wr_id != wr_id)
 		prev = &(*prev)->next;
@@ -510,7 +538,7 @@ static struct nex_pending_read *nex_take_pending_read(struct nex_qp *qp, uint64_
 		entry = *prev;
 		*prev = entry->next;
 	}
-	fiber_pthread_spin_unlock(&qp->rdma_lock);
+	pthread_mutex_unlock(&qp->rdma_lock);
 	return entry;
 }
 
@@ -525,6 +553,8 @@ static int fiber_send_msg(struct nex_qp *qp, struct nex_msg_hdr *hdr,
 	qp->next_tag = (qp->next_tag % 0xFFFFu) + 1u;
 	// Use reserved header field to pass a unique tag to the network backend.
 	hdr->reserved = tag;
+	if (nex_use_tcp_backend() && nex_tcp_message_begin(qp->tx_fd, payload_len))
+		return errno ? errno : EIO;
 	if (fiber_write_full(qp->tx_fd, hdr, sizeof(*hdr), 0))  // header: no perf model
 		rc = errno ? errno : EIO;
 	NEX_TRACE("nex_send_msg sent hdr");
@@ -536,6 +566,7 @@ static int fiber_send_msg(struct nex_qp *qp, struct nex_msg_hdr *hdr,
 		*out_slot = -1;
 	}
 	NEX_TRACE("nex_send_msg sent payload");
+	if (nex_use_tcp_backend()) nex_tcp_message_end(qp->tx_fd);
 	return rc;
 }
 
@@ -551,7 +582,10 @@ static void nex_sendq_push(struct nex_qp *qp, struct nex_send_task *task)
 			return;
 		}
 		pthread_spin_unlock(&qp->send_task_lock);
-		sched_yield();
+		/* READ responses are submitted by the RX fiber, not an application
+		 * pthread. Yield siblings if its TX queue is temporarily full. */
+		if (task->hdr.opcode == NEX_MSG_RDMA_READ_RESP) gx_fiber_idle_yield();
+		else sched_yield();
 	}
 }
 
@@ -626,36 +660,16 @@ static void fiber_tx_send_worker(void *arg)
 {
 	struct nex_qp *qp = arg;
 
-	uint64_t last_consume_time = now_ns();
-	int consume_count = 0;
-	float rate = 0;
 	for (;;) {
 		struct nex_send_task *task = NULL;
 		if (fiber_sendq_try_pop(qp, &task)) {
-			// apply rate limiting:
-			// 5 per us, 20 per 4 us, 40, per 8us.
-			// consume_count++;
-			// if(consume_count % 20 == 0){
-			// 	uint64_t now;
-			// 	do{
-			// 		now = now_ns();
-			// 		rate = 20.0 / (now - last_consume_time);
-			// 		if(rate > 0.005){
-			// 			gx_fiber_idle_yield();
-			// 		}else{
-			// 			break;
-			// 		}
-			// 	} while(1);
-			// 	last_consume_time = now;
-			// 	consume_count = 0;
-			// }
-
 			int tx_slot = -1;
 			int rc = fiber_send_msg(task->qp, &task->hdr,
 						task->payload_iov, task->payload_iovcnt,
 						task->payload_len, task->wait_completion,
 						&tx_slot);
-			bool is_read_req = task->hdr.opcode == NEX_MSG_RDMA_READ_REQ;
+			bool is_read = task->hdr.opcode == NEX_MSG_RDMA_READ_REQ ||
+			               task->hdr.opcode == NEX_MSG_RDMA_READ_RESP;
 			if (rc) {
 				/* Peer died mid-send: surface an error completion so the
 				 * consumer (e.g. NCCL's proxy) sees ncclRemoteError and can
@@ -671,7 +685,7 @@ static void fiber_tx_send_worker(void *arg)
 				};
 				if (task->wait_completion)
 					fiber_cq_push(qp->send_cq, &err_wc);
-			} else if (!is_read_req) {
+			} else if (!is_read) {
 				struct nex_tx_wait_entry entry = {
 					.wr_id = task->tx_wr_id,
 					.wc_op = (task->hdr.opcode == NEX_MSG_RDMA_WRITE ||
@@ -681,6 +695,8 @@ static void fiber_tx_send_worker(void *arg)
 					.byte_len = (uint32_t)task->payload_len,
 					.slot = tx_slot,
 					.wait_completion = task->wait_completion,
+					.ready_ns = nex_use_tcp_backend() ?
+						nex_tcp_completion_time(qp->tx_fd, qp->vqp.qp.qp_type == IBV_QPT_RC) : 0,
 				};
 				fiber_txq_push(qp, &entry);
 			}
@@ -709,6 +725,7 @@ static void fiber_tx_worker(void *arg)
 	for (;;) {
 		struct nex_tx_wait_entry entry;
 		if (fiber_txq_try_pop(qp, &entry)) {
+			if (entry.ready_ns) nex_tcp_wait_until(qp->tx_fd, entry.ready_ns);
 			struct ibv_wc wc = {
 				.wr_id = entry.wr_id,
 				.status = IBV_WC_SUCCESS,
@@ -814,6 +831,7 @@ static int nex_query_device(struct ibv_context *context,
 			    const struct ibv_query_device_ex_input *input,
 			    struct ibv_device_attr_ex *attr, size_t attr_size)
 {
+	NEX_CPU_SCOPE;
 	memset(attr, 0, attr_size);
 
 	// doesn't care
@@ -845,6 +863,7 @@ static int nex_query_device(struct ibv_context *context,
 static int nex_query_port(struct ibv_context *context, uint8_t port,
 			  struct ibv_port_attr *attr)
 {
+	NEX_CPU_SCOPE;
 	if (port != 1)
 		return EINVAL;
 
@@ -885,6 +904,7 @@ rkey (remote key): you give it to a remote peer when you want them to access you
 
 static struct ibv_pd *nex_alloc_pd(struct ibv_context *context)
 {
+	NEX_CPU_SCOPE;
 	struct nex_context *nctx = to_nctx(context);
 	struct nex_pd *pd = calloc(1, sizeof(*pd));
 	if (!pd)
@@ -897,6 +917,7 @@ static struct ibv_pd *nex_alloc_pd(struct ibv_context *context)
 
 static int nex_dealloc_pd(struct ibv_pd *pd)
 {
+	NEX_CPU_SCOPE;
 	free(to_npd(pd));
 	return 0;
 }
@@ -904,6 +925,7 @@ static int nex_dealloc_pd(struct ibv_pd *pd)
 static struct ibv_mr *nex_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 				 uint64_t hca_va, int access)
 {
+	NEX_CPU_SCOPE;
 	NEX_TRACE("reg_mr addr=%p len=%zu access=0x%x", addr, length, access);
 
 	if (!length) {
@@ -948,6 +970,7 @@ static struct ibv_mr *nex_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 static struct ibv_mr *nex_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
 			       uint64_t length, uint64_t iova, int fd, int access)
 {
+	NEX_CPU_SCOPE;
 	(void)offset;
 	(void)fd;
 	void *addr = (void *)(uintptr_t)iova;
@@ -956,6 +979,7 @@ static struct ibv_mr *nex_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
 
 static int nex_dereg_mr(struct verbs_mr *vmr)
 {
+	NEX_CPU_SCOPE;
 	struct nex_mr *mr = container_of(vmr, struct nex_mr, vmr);
 	struct nex_context *ctx = to_nctx(vmr->ibv_mr.context);
 	pthread_spin_lock(&ctx->mr_lock);
@@ -975,6 +999,7 @@ static struct ibv_cq *nex_create_cq(struct ibv_context *context, int cqe,
 				    struct ibv_comp_channel *channel,
 				    int comp_vector)
 {
+	NEX_CPU_SCOPE;
 	struct nex_context *ctx = to_nctx(context);
 	struct nex_cq *cq = calloc(1, sizeof(*cq));
 	if (!cq)
@@ -1007,6 +1032,7 @@ static struct ibv_cq *nex_create_cq(struct ibv_context *context, int cqe,
 
 static int nex_destroy_cq(struct ibv_cq *ibcq)
 {
+	NEX_CPU_SCOPE;
 	struct nex_cq *cq = to_ncq(ibcq);
 	pthread_spin_destroy(&cq->lock);
 	free(cq->entries);
@@ -1016,12 +1042,14 @@ static int nex_destroy_cq(struct ibv_cq *ibcq)
 
 static int nex_poll_cq(struct ibv_cq *ibcq, int num_entries, struct ibv_wc *wc)
 {
+	NEX_CPU_SCOPE;
 	struct nex_cq *cq = to_ncq(ibcq);
 	return nex_cq_pop(cq, num_entries, wc);
 }
 
 static int nex_req_notify_cq(struct ibv_cq *ibcq, int solicited_only)
 {
+	NEX_CPU_SCOPE;
 	(void)ibcq;
 	(void)solicited_only;
 	return 0;
@@ -1032,6 +1060,7 @@ static int nex_req_notify_cq(struct ibv_cq *ibcq, int solicited_only)
 static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
                     struct ibv_qp_init_attr *attr)
 {
+	NEX_CPU_SCOPE;
     struct nex_context *ctx = to_nctx(pd->context);
     struct nex_qp *qp = calloc(1, sizeof(*qp));
 	if (!qp){
@@ -1065,7 +1094,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 	}
 	qp->recv_head = qp->recv_tail = 0;
 	pthread_spin_init(&qp->lock, PTHREAD_PROCESS_PRIVATE);
-	pthread_spin_init(&qp->rdma_lock, PTHREAD_PROCESS_PRIVATE);
+	pthread_mutex_init(&qp->rdma_lock, NULL);
 	qp->pending_reads = NULL;
 	pthread_mutex_init(&qp->state_lock, NULL);
 	pthread_cond_init(&qp->state_cond, NULL);
@@ -1092,7 +1121,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 	if (!qp->send_task_queue) {
 		pthread_mutex_destroy(&qp->state_lock);
 		pthread_cond_destroy(&qp->state_cond);
-		pthread_spin_destroy(&qp->rdma_lock);
+		pthread_mutex_destroy(&qp->rdma_lock);
 		pthread_spin_destroy(&qp->lock);
 		free(qp->recv_queue);
 		free(qp);
@@ -1109,7 +1138,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 		free(qp->send_task_queue);
 		pthread_mutex_destroy(&qp->state_lock);
 		pthread_cond_destroy(&qp->state_cond);
-		pthread_spin_destroy(&qp->rdma_lock);
+		pthread_mutex_destroy(&qp->rdma_lock);
 		pthread_spin_destroy(&qp->lock);
 		free(qp->recv_queue);
 		free(qp);
@@ -1144,7 +1173,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 
 	if (nex_qp_reserve(qp)) {
 		pthread_spin_destroy(&qp->lock);
-		pthread_spin_destroy(&qp->rdma_lock);
+		pthread_mutex_destroy(&qp->rdma_lock);
 		pthread_mutex_destroy(&qp->state_lock);
 		pthread_cond_destroy(&qp->state_cond);
 		pthread_spin_destroy(&qp->send_task_lock);
@@ -1163,6 +1192,7 @@ static struct ibv_qp *nex_create_qp(struct ibv_pd *pd,
 
 static int nex_destroy_qp(struct ibv_qp *ibqp)
 {
+	NEX_CPU_SCOPE;
 	struct nex_qp *qp = to_nqp(ibqp);
 	nex_qp_release(qp);
 
@@ -1229,7 +1259,7 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 	qp->tx_wait_head = qp->tx_wait_tail;
 
 	pthread_spin_destroy(&qp->lock);
-	pthread_spin_lock(&qp->rdma_lock);
+	pthread_mutex_lock(&qp->rdma_lock);
 	struct nex_pending_read *pending = qp->pending_reads;
 	while (pending) {
 		struct nex_pending_read *next = pending->next;
@@ -1237,8 +1267,8 @@ static int nex_destroy_qp(struct ibv_qp *ibqp)
 		pending = next;
 	}
 	qp->pending_reads = NULL;
-	pthread_spin_unlock(&qp->rdma_lock);
-	pthread_spin_destroy(&qp->rdma_lock);
+	pthread_mutex_unlock(&qp->rdma_lock);
+	pthread_mutex_destroy(&qp->rdma_lock);
 	pthread_mutex_destroy(&qp->state_lock);
 	pthread_cond_destroy(&qp->state_cond);
 	pthread_mutex_destroy(&qp->vqp.qp.mutex);
@@ -1288,6 +1318,7 @@ Most applications only care about INIT → RTR → RTS.
 static int nex_modify_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
 			 int attr_mask)
 {
+	NEX_CPU_SCOPE;
 	NEX_TRACE("modify_qp qpn=%u mask=0x%x state=%d\n",
 		ibqp->qp_num, attr_mask,
 		(attr_mask & IBV_QP_STATE) ? attr->qp_state : -1);
@@ -1333,6 +1364,7 @@ static int nex_modify_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
 static int nex_query_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
 			int attr_mask, struct ibv_qp_init_attr *init_attr)
 {
+	NEX_CPU_SCOPE;
 	(void)attr_mask;
 	(void)init_attr;
 
@@ -1430,6 +1462,7 @@ static int nex_qp_wait_connected(struct nex_qp *qp)
 static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 			 struct ibv_recv_wr **bad_wr)
 {
+	NEX_CPU_SCOPE;
 	struct nex_qp *qp = to_nqp(ibqp);
 
 	// iterate through work requests (wr)
@@ -1481,6 +1514,7 @@ static int nex_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 static struct ibv_srq *nex_create_srq(struct ibv_pd *pd,
 				      struct ibv_srq_init_attr *attr)
 {
+	NEX_CPU_SCOPE;
 	struct nex_srq *srq = calloc(1, sizeof(*srq));
 	if (!srq) {
 		errno = ENOMEM;
@@ -1509,6 +1543,7 @@ static struct ibv_srq *nex_create_srq(struct ibv_pd *pd,
 
 static int nex_destroy_srq(struct ibv_srq *ibsrq)
 {
+	NEX_CPU_SCOPE;
 	struct nex_srq *srq = to_nsrq(ibsrq);
 
 	pthread_spin_destroy(&srq->lock);
@@ -1519,6 +1554,7 @@ static int nex_destroy_srq(struct ibv_srq *ibsrq)
 
 static int nex_query_srq(struct ibv_srq *ibsrq, struct ibv_srq_attr *attr)
 {
+	NEX_CPU_SCOPE;
 	struct nex_srq *srq = to_nsrq(ibsrq);
 
 	attr->max_wr = srq->recv_size - 1;
@@ -1530,6 +1566,7 @@ static int nex_query_srq(struct ibv_srq *ibsrq, struct ibv_srq_attr *attr)
 static int nex_post_srq_recv(struct ibv_srq *ibsrq, struct ibv_recv_wr *wr,
 			     struct ibv_recv_wr **bad_wr)
 {
+	NEX_CPU_SCOPE;
 	struct nex_srq *srq = to_nsrq(ibsrq);
 
 	for (; wr; wr = wr->next) {
@@ -1573,6 +1610,7 @@ static int nex_post_srq_recv(struct ibv_srq *ibsrq, struct ibv_recv_wr *wr,
 static int nex_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			 struct ibv_send_wr **bad_wr)
 {
+	NEX_CPU_SCOPE;
 
 	
 
@@ -2028,19 +2066,20 @@ static void fiber_rx_worker(void *arg)
 					resp_buf = (uint8_t *)src;
 				}
 			}
-			struct iovec resp_iov = {
-				.iov_base = resp_buf,
-				.iov_len = resp.length,
-			};
-            int tx_slot = -1;
-            if (fiber_send_msg(qp, &resp,
-                             (resp.length && resp_buf) ? &resp_iov : NULL,
-                             (resp.length && resp_buf) ? 1 : 0,
-                             resp.length,
-                             false,
-                             &tx_slot))
-                   NEX_TRACE("failed to send rdma_read_resp qp_pair=%u:%u",
-                           qp->vqp.qp.qp_num, qp->remote_qp_num);
+			/* Never block reception on an outbound response. A bounded
+			 * transport may need later epochs to drain a preceding response,
+			 * while current-epoch READ requests still need to be consumed. */
+			struct iovec *resp_iov = NULL;
+			if (resp.length && resp_buf) {
+				resp_iov = malloc(sizeof(*resp_iov));
+				if (!resp_iov) abort();
+				*resp_iov = (struct iovec){.iov_base = resp_buf, .iov_len = resp.length};
+			}
+			if (nex_txq_send_msg(qp, &resp, resp_iov, resp_iov ? 1 : 0,
+			                    resp.length, false, hdr.wr_id)) {
+				NEX_ERROR("cannot queue rdma_read_resp");
+				abort();
+			}
 			
 			NEX_TRACE("rdma_read_resp sent wr_id=%" PRIu64 " len=%u qp_pair=%u:%u",
 					   resp.wr_id, resp.length,
@@ -2294,6 +2333,7 @@ static void nex_qp_release(struct nex_qp *qp)
 
 static struct ibv_ah *nex_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 {
+	NEX_CPU_SCOPE;
 	(void)pd;
 	(void)attr;
 	return calloc(1, sizeof(struct ibv_ah));
@@ -2301,6 +2341,7 @@ static struct ibv_ah *nex_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 
 static int nex_destroy_ah(struct ibv_ah *ah)
 {
+	NEX_CPU_SCOPE;
 	free(ah);
 	return 0;
 }
@@ -2309,6 +2350,7 @@ static int nex_destroy_ah(struct ibv_ah *ah)
 
 static void nex_free_context(struct ibv_context *ibctx)
 {
+	NEX_CPU_SCOPE;
 	struct nex_context *ctx = to_nctx(ibctx);
 	if (ctx->qp_counter) {
 		munmap(ctx->qp_counter, sizeof(uint32_t));
@@ -2382,30 +2424,28 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
 					       int cmd_fd, void *private_data)
 {
 	struct nex_context *ctx;
+	if (get_nex_id() < 0 || get_nex_id() > 0xefff) {
+		fprintf(stderr, "GX_ID must fit the GX 16-bit LID range (0..61439)\n");
+		errno = EINVAL;
+		return NULL;
+	}
 	
 	if (get_accvm_symbols(&accvm_syms) != 0) {
     	fprintf(stderr, "Error: required ACCVM symbols not available\n");
     	return NULL;
   	}
 
+	NEX_CPU_SCOPE;
 	if (gx_sched_acquire() != 0) {
 		fprintf(stderr, "Error: failed to initialize ACCVM fiber scheduler\n");
 		return NULL;
 	}
+	if (gx_nic_prepare()) { gx_sched_release(); return NULL; }
 
 	// MACRO
 	ctx = verbs_init_and_alloc_context(ibdev, cmd_fd, ctx, ibv_ctx,
 					       RDMA_DRIVER_UNKNOWN);
 	if (!ctx) {
-		gx_sched_release();
-		return NULL;
-	}
-
-	struct ibv_get_context cmd = {};
-	struct ib_uverbs_get_context_resp resp = {};
-	if (ibv_cmd_get_context(&ctx->ibv_ctx, &cmd, sizeof(cmd), NULL,
-					&resp, sizeof(resp))) {
-		free(ctx);
 		gx_sched_release();
 		return NULL;
 	}
@@ -2427,8 +2467,11 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
     nex_map_qp_counter(ctx);
 
 	int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-	if (efd >= 0)
-		ctx->ibv_ctx.context.async_fd = efd;
+	if (efd < 0) {
+		nex_free_context(&ctx->ibv_ctx.context);
+		return NULL;
+	}
+	ctx->ibv_ctx.context.async_fd = efd;
 
 	verbs_set_ops(&ctx->ibv_ctx, &nex_ctx_ops);
 

@@ -560,7 +560,7 @@ int ibverbs_get_device_list(struct list_head *device_list)
 	ret = find_sysfs_devs_nl(&sysfs_list);
 	if (ret) {
 		ret = find_sysfs_devs(&sysfs_list);
-		if (ret)
+		if (ret && ret != ENOENT && ret != ENOSYS)
 			return -ret;
 	}
 
@@ -569,6 +569,27 @@ int ibverbs_get_device_list(struct list_head *device_list)
 		if (ret)
 			return -ret;
 	}
+
+	/* This is GX's private libibverbs, not the system library. Expose its
+	 * software device without requiring a host module or a writable /sys.
+	 * Replace a legacy kernel gx0 entry rather than exposing it twice. */
+	list_for_each_safe(&sysfs_list, sysfs_dev, next_dev, entry) {
+		if (!strcmp(sysfs_dev->ibdev_name, "gx0")) {
+			list_del(&sysfs_dev->entry);
+			free(sysfs_dev);
+		}
+	}
+	sysfs_dev = calloc(1, sizeof(*sysfs_dev));
+	if (!sysfs_dev)
+		return -ENOMEM;
+	strcpy(sysfs_dev->ibdev_name, "gx0");
+	strcpy(sysfs_dev->sysfs_name, "gx-userspace");
+	sysfs_dev->abi_ver = 1;
+	sysfs_dev->ibdev_idx = -1;
+	sysfs_dev->node_type = IBV_NODE_CA;
+	sysfs_dev->flags = VSYSFS_USERSPACE | VSYSFS_READ_NODE_GUID;
+	sysfs_dev->node_guid = UINT64_C(0x4758000000000001);
+	list_add(&sysfs_list, &sysfs_dev->entry);
 
 	/* Remove entries from the sysfs_list that are already preset in the
 	 * device_list, and remove entries from the device_list that are not

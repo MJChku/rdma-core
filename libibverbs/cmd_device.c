@@ -445,6 +445,18 @@ int __ibv_query_gid_ex(struct ibv_context *context, uint32_t port_num,
 			    uint32_t flags, size_t entry_size,
 			    uint32_t fallback_attr_mask)
 {
+	if (verbs_get_device(context->device)->sysfs &&
+	    (verbs_get_device(context->device)->sysfs->flags & VSYSFS_USERSPACE)) {
+		struct ibv_port_attr port;
+		if (flags || gid_index || entry_size < sizeof(*entry) ||
+		    ibv_query_port(context, port_num, &port)) return EINVAL;
+		memset(entry, 0, sizeof(*entry));
+		entry->port_num = port_num;
+		entry->gid_type = IBV_GID_TYPE_IB;
+		entry->gid.global.subnet_prefix = htobe64(UINT64_C(0xfe80000000000000));
+		entry->gid.global.interface_id = htobe64(port.lid);
+		return 0;
+	}
 	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_DEVICE,
 			       UVERBS_METHOD_QUERY_GID_ENTRY, 4);
 	int ret;
@@ -493,6 +505,12 @@ ssize_t _ibv_query_gid_table(struct ibv_context *context,
 				size_t max_entries, uint32_t flags,
 				size_t entry_size)
 {
+	if (verbs_get_device(context->device)->sysfs &&
+	    (verbs_get_device(context->device)->sysfs->flags & VSYSFS_USERSPACE)) {
+		if (!max_entries) return -EINVAL;
+		int rc = __ibv_query_gid_ex(context, 1, 0, entries, flags, entry_size, 0);
+		return rc ? -rc : 1;
+	}
 	DECLARE_COMMAND_BUFFER(cmdb, UVERBS_OBJECT_DEVICE,
 			       UVERBS_METHOD_QUERY_GID_TABLE, 4);
 	uint64_t num_entries;

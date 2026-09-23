@@ -1,4 +1,5 @@
 #include "nex_tcp.h"
+#include "nex_simbricks.h"
 
 #include <arpa/inet.h>
 #include <dlfcn.h>
@@ -34,6 +35,7 @@ struct nex_tcp_conn {
     uint32_t remote_lid;
     uint32_t local_qp;
     uint32_t remote_qp;
+    struct gx_nic_link *timing;
 };
 
 static struct nex_tcp_conn g_conns[NEX_TCP_MAX_CONN];
@@ -74,7 +76,7 @@ static int wait_socket_ready(int fd, short events)
             return 0;
         if (rc < 0 && errno != EINTR)
             return -1;
-        gx_fiber_idle_yield();
+        gx_fiber_transport_yield();
     }
 }
 
@@ -240,7 +242,7 @@ static int connect_with_retry(const char *host, uint16_t port)
             close(s);
         }
         if (data_fd < 0)
-            gx_fiber_idle_yield();
+            gx_fiber_transport_yield();
     }
 
     freeaddrinfo(res);
@@ -256,7 +258,7 @@ static int write_all_sock(int sock_fd, const void *buf, size_t len)
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                gx_fiber_idle_yield();
+                gx_fiber_transport_yield();
                 continue;
             }
             return -1;
@@ -278,7 +280,7 @@ static int read_all_sock(int sock_fd, void *buf, size_t len)
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                gx_fiber_idle_yield();
+                gx_fiber_transport_yield();
                 continue;
             }
             return -1;
@@ -313,7 +315,7 @@ static int writev_all_sock(int sock_fd, const struct iovec *iov, int iovcnt, siz
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                gx_fiber_idle_yield();
+                gx_fiber_transport_yield();
                 continue;
             }
             if (local != stack_iov)
@@ -359,7 +361,7 @@ static int readv_all_sock(int sock_fd, const struct iovec *iov, int iovcnt, size
                 if (errno == EINTR)
                     continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    gx_fiber_idle_yield();
+                    gx_fiber_transport_yield();
                     continue;
                 }
                 return -1;
@@ -413,7 +415,7 @@ int nex_tcp_dial(const char *service_id, int *fd_out)
             if (errno == EINTR)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                gx_fiber_idle_yield();
+                gx_fiber_transport_yield();
                 continue;
             }
             break;
@@ -429,6 +431,18 @@ int nex_tcp_dial(const char *service_id, int *fd_out)
     close(listen_fd);
     if (data_fd < 0)
         return errno ? errno : EIO;
+
+    /* No mixed old/new wire formats or mismatched clock/link configuration. */
+    uint64_t hello[6] = {UINT64_C(0x47584e4943000002), gx_nic_enabled(), 0, 0, 0, 0};
+    uint64_t remote[6];
+    if (hello[1]) gx_nic_config(&hello[2]);
+    for (unsigned i = 0; i < 6; ++i) hello[i] = htobe64(hello[i]);
+    if (write_all_sock(data_fd, hello, sizeof(hello)) ||
+        read_all_sock(data_fd, remote, sizeof(remote)) ||
+        memcmp(hello, remote, sizeof(hello))) {
+        fprintf(stderr, "GX_NIC incompatible peer transport/timing configuration\n");
+        close(data_fd); return EPROTO;
+    }
 
     int slot = conn_alloc();
     if (slot < 0) {
@@ -448,6 +462,10 @@ int nex_tcp_dial(const char *service_id, int *fd_out)
     c->remote_lid = remote_lid;
     c->local_qp = local_qp;
     c->remote_qp = peer.qp_num ? peer.qp_num : remote_qp;
+    if (gx_nic_enabled()) {
+        c->timing = gx_nic_open(data_fd, local_lid);
+        if (!c->timing) { close(data_fd); conn_release(slot); return ENOMEM; }
+    }
     *fd_out = slot;
     return 0;
 }
@@ -464,6 +482,7 @@ ssize_t nex_tcp_read(int fd, void *buf, size_t len, int apply_perf_model)
 
     (void)apply_perf_model;
 
+    if (c->timing) return gx_nic_read(c->timing, buf, len);
     if (read_all_sock(c->sock_fd, buf, len) != 0)
         return -1;
 
@@ -482,6 +501,7 @@ ssize_t nex_tcp_write(int fd, const void *buf, size_t len, int apply_perf_model)
 
     (void)apply_perf_model;
 
+    if (c->timing) return gx_nic_write(c->timing, buf, len);
     if (write_all_sock(c->sock_fd, buf, len) != 0)
         return -1;
 
@@ -520,6 +540,11 @@ ssize_t nex_tcp_writev(int fd, const struct iovec *iov, int iovcnt,
     if (slot_out)
         *slot_out = -1;
 
+    if (c->timing) {
+        for (int i = 0; i < iovcnt; ++i)
+            if (gx_nic_write(c->timing, iov[i].iov_base, iov[i].iov_len) < 0) return -1;
+        return total_len;
+    }
     if (writev_all_sock(c->sock_fd, iov, iovcnt, total_len) != 0)
         return -1;
 
@@ -558,6 +583,11 @@ ssize_t nex_tcp_readv(int fd, const struct iovec *iov, int iovcnt,
     if (slot_out)
         *slot_out = -1;
 
+    if (c->timing) {
+        for (int i = 0; i < iovcnt; ++i)
+            if (gx_nic_read(c->timing, iov[i].iov_base, iov[i].iov_len) < 0) return -1;
+        return total_len;
+    }
     if (readv_all_sock(c->sock_fd, iov, iovcnt, total_len) != 0)
         return -1;
 
@@ -569,6 +599,7 @@ int nex_tcp_close(int fd)
     struct nex_tcp_conn *c = conn_get(fd);
     if (!c)
         return EBADF;
+    gx_nic_close(c->timing);
     if (c->sock_fd >= 0)
         close(c->sock_fd);
     c->sock_fd = -1;
@@ -581,7 +612,30 @@ int nex_tcp_shutdown(int fd)
     struct nex_tcp_conn *c = conn_get(fd);
     if (!c)
         return EBADF;
+    gx_nic_shutdown(c->timing);
     if (c->sock_fd >= 0)
         shutdown(c->sock_fd, SHUT_RDWR);
     return 0;
+}
+
+int nex_tcp_message_begin(int fd, size_t payload_bytes)
+{
+    struct nex_tcp_conn *c = conn_get(fd);
+    if (!c) { errno = EBADF; return -1; }
+    return c->timing ? gx_nic_begin(c->timing, payload_bytes) : 0;
+}
+void nex_tcp_message_end(int fd)
+{
+    struct nex_tcp_conn *c = conn_get(fd);
+    if (c && c->timing) gx_nic_end(c->timing);
+}
+uint64_t nex_tcp_completion_time(int fd, bool acknowledged)
+{
+    struct nex_tcp_conn *c = conn_get(fd);
+    return c && c->timing ? gx_nic_completion_time(c->timing, acknowledged) : 0;
+}
+void nex_tcp_wait_until(int fd, uint64_t time_ns)
+{
+    struct nex_tcp_conn *c = conn_get(fd);
+    if (c && c->timing) gx_nic_wait_until(c->timing, time_ns);
 }

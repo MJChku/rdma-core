@@ -63,6 +63,13 @@ static uint32_t parse_u32(const char* s)
 int get_accvm_symbols(struct accvm_symbols* syms) {
     void* handle = RTLD_DEFAULT;
 
+    syms->compress_time = dlsym(handle, "compressT");
+    syms->compression_factor = dlsym(handle, "compressT_factor");
+    if (!syms->compress_time || !syms->compression_factor) {
+        NEX_ERROR("GX runtime is missing compressT scope support\n");
+        return -1;
+    }
+
     syms->gx_sched_init = (gx_sched_init_t)dlsym(handle, "gx_sched_init");
     if (!syms->gx_sched_init) {
         NEX_ERROR("getting gx_sched_init: %s\n", dlerror());
@@ -93,6 +100,12 @@ int get_accvm_symbols(struct accvm_symbols* syms) {
         return -1;
     }
 
+    syms->gx_fiber_transport_yield = (gx_fiber_idle_yield_t)dlsym(handle, "gx_fiber_transport_yield");
+    if (!syms->gx_fiber_transport_yield) {
+        NEX_ERROR("getting gx_fiber_transport_yield: %s\n", dlerror());
+        return -1;
+    }
+
     return 0;
 }
 
@@ -104,6 +117,11 @@ inline void gx_fiber_yield(void)
 inline void gx_fiber_idle_yield(void)
 {
   accvm_syms.gx_fiber_idle_yield();
+}
+
+void gx_fiber_transport_yield(void)
+{
+  accvm_syms.gx_fiber_transport_yield();
 }
 
 void nex_fast_memcpy(void* dst, const void* src, size_t len) {

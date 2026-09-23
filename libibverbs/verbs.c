@@ -259,6 +259,11 @@ LATEST_SYMVER_FUNC(ibv_query_pkey, 1_1, "IBVERBS_1.1",
 	struct verbs_device *verbs_device = verbs_get_device(context->device);
 	char attr[8];
 	uint16_t val;
+	if (verbs_device->sysfs && (verbs_device->sysfs->flags & VSYSFS_USERSPACE)) {
+		if (port_num != 1 || index != 0) { errno = EINVAL; return -1; }
+		*pkey = htobe16(0xffff);
+		return 0;
+	}
 
 	if (ibv_read_ibdev_sysfs_file(attr, sizeof(attr), verbs_device->sysfs,
 				      "ports/%d/pkeys/%d", port_num, index) < 0)

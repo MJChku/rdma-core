@@ -235,6 +235,9 @@ void load_drivers(void)
 	char *list, *env_name;
 
 	read_config();
+	/* GX ships this private verbs library together with its software provider.
+	 * Discovery must not depend on a host /etc/libibverbs.d installation. */
+	load_driver("gx");
 
 	/* Only use drivers passed in through the calling user's environment
 	 * if we're not running setuid.

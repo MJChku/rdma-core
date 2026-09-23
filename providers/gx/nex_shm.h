@@ -13,11 +13,14 @@ typedef void (*gx_fiber_yield_t)(void);
 typedef void (*gx_fiber_idle_yield_t)(void);
 
 struct accvm_symbols {
+    void (*compress_time)(float);
+    float (*compression_factor)(void);
     gx_sched_init_t gx_sched_init;
     gx_sched_new_fiber_t gx_sched_new_fiber;
     gx_sched_shutdown_t gx_sched_shutdown;
     gx_fiber_yield_t gx_fiber_yield;
     gx_fiber_idle_yield_t gx_fiber_idle_yield;
+    gx_fiber_idle_yield_t gx_fiber_transport_yield;
 };
 
 int nex_shm_dial(const char* service_id, int* fd_out);
@@ -34,6 +37,7 @@ int nex_shm_shutdown(int fd);
 void nex_fast_memcpy(void* dst, const void* src, size_t len);
 void gx_fiber_yield(void);
 void gx_fiber_idle_yield(void);
+void gx_fiber_transport_yield(void);
 int get_accvm_symbols(struct accvm_symbols* syms);
 
 extern struct accvm_symbols accvm_syms;
