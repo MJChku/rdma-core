@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <stdbool.h>
@@ -28,7 +29,7 @@
 #include "nex.h"
 #include "nex_shm.h"
 #include "nex_tcp.h"
-#include "nex_simbricks.h"
+#include "nex_timing.h"
 #include "cm/nex_cm.h"
 
 static int get_nex_id(void);
@@ -174,6 +175,29 @@ static int get_nex_id(void){
 	return nex_id;
 }
 
+/* GX_ID selects a GPU within a node; it is not a fabric-wide address.
+ * QP numbers can repeat in separate containers, so CM matching must also
+ * distinguish their nodes. Reserve eight bits for the node-local device. */
+static int get_nex_lid(void)
+{
+	const char *node_env = getenv("GX_GLOBAL_ID");
+	char *end;
+	long node = 0;
+	int device = get_nex_id();
+	/* Standalone verbs programs use GX_ID as their fabric endpoint ID. */
+	if (!node_env)
+		return device >= 0 && device <= 0xefff ? 0x1000 + device : -1;
+	if (node_env) {
+		errno = 0;
+		node = strtol(node_env, &end, 10);
+		if (errno || end == node_env || *end || node < 0 || node > 239)
+			return -1;
+	}
+	if (device < 0 || device > 255)
+		return -1;
+	return 0x1000 + (int)node * 256 + device;
+}
+
 static pthread_mutex_t g_sched_ref_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned g_sched_refcount = 0;
 
@@ -296,10 +320,22 @@ static int nex_map_qp_counter(struct nex_context *ctx)
 {
 	if (ctx->qp_counter)
 		return 0;
-	int nex_id = get_nex_id();
-	char shm_name[128];
-	snprintf(shm_name, sizeof(shm_name), "/nex_qpcnt_dev%d", nex_id);
-	int fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
+	char name[PATH_MAX];
+	const char *run = getenv("GX_RUN_ARTIFACTS");
+	int fd;
+	if (run && *run) {
+		/* Reservations belong to a device in this run, not every container
+		 * using the same local GX_ID, nor a previously terminated run. */
+		if (snprintf(name, sizeof(name), "%s/nex_qpcnt_dev%u", run,
+		             (unsigned)ctx->lid) >= (int)sizeof(name)) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+		fd = open(name, O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+	} else {
+		snprintf(name, sizeof(name), "/nex_qpcnt_dev%d", get_nex_id());
+		fd = shm_open(name, O_CREAT | O_RDWR, 0666);
+	}
 	if (fd < 0)
 		return -1;
 	if (ftruncate(fd, sizeof(uint32_t)) != 0) {
@@ -566,7 +602,8 @@ static int fiber_send_msg(struct nex_qp *qp, struct nex_msg_hdr *hdr,
 		*out_slot = -1;
 	}
 	NEX_TRACE("nex_send_msg sent payload");
-	if (nex_use_tcp_backend()) nex_tcp_message_end(qp->tx_fd);
+	if (nex_use_tcp_backend() && nex_tcp_message_end(qp->tx_fd) && !rc)
+		rc = errno ? errno : EIO;
 	return rc;
 }
 
@@ -2424,8 +2461,9 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
 					       int cmd_fd, void *private_data)
 {
 	struct nex_context *ctx;
-	if (get_nex_id() < 0 || get_nex_id() > 0xefff) {
-		fprintf(stderr, "GX_ID must fit the GX 16-bit LID range (0..61439)\n");
+	int lid = get_nex_lid();
+	if (lid < 0) {
+		fprintf(stderr, "GX RDMA requires GX_GLOBAL_ID in 0..239 and GX_ID in 0..255\n");
 		errno = EINVAL;
 		return NULL;
 	}
@@ -2453,6 +2491,7 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
 	atomic_init(&ctx->next_handle, 1);
 	atomic_init(&ctx->next_key, 1);
 	atomic_init(&ctx->next_port, 0);
+	ctx->lid = lid;
     ctx->qp_counter_fd = -1;
     ctx->qp_counter = NULL;
     ctx->qp_limit = NEX_DEFAULT_MAX_QP;
@@ -2475,7 +2514,6 @@ static struct verbs_context *nex_alloc_context(struct ibv_device *ibdev,
 
 	verbs_set_ops(&ctx->ibv_ctx, &nex_ctx_ops);
 
-	ctx->lid = get_nex_id()+0x1000; // avoid 0 lid
 	return &ctx->ibv_ctx;
 }
 

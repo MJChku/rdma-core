@@ -9,9 +9,9 @@ struct nex_service {
 
 /* RC completion includes forward delivery plus a return acknowledgement.
  * The acknowledgement is a timing delay, not another payload transfer. */
-static inline uint64_t nex_service_ack(uint64_t end, uint64_t epoch, uint64_t latency)
+static inline uint64_t nex_service_ack(uint64_t end, uint64_t latency)
 {
-    return ((end + epoch - 1) / epoch) * epoch + 2 * latency;
+    return end + 2 * latency;
 }
 
 /* One call per outgoing functional message, independent of CQ polling and

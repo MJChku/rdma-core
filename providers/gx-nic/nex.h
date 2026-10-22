@@ -1,0 +1,184 @@
+/*
+ * NEX RDMA Emulation Provider Header
+ *
+ * Minimal in-process RDMA semantics implemented completely in user space.
+ */
+
+#ifndef NEX_H
+#define NEX_H
+
+#include <infiniband/driver.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stddef.h>
+
+#define NEX_MAX_SGE           8
+
+struct nex_device {
+	struct verbs_device ibv_dev;
+};
+
+struct nex_mr;
+
+struct nex_context {
+	struct verbs_context ibv_ctx;
+	atomic_uint next_handle;
+	atomic_uint next_key;
+	atomic_uint next_port;
+    int qp_counter_fd;
+    uint32_t *qp_counter;
+    uint32_t qp_limit;
+    pthread_spinlock_t mr_lock;
+    struct nex_mr *mr_list;
+	int gid;
+	int lid;
+};
+
+struct nex_pd {
+	struct ibv_pd ibv_pd;
+};
+
+struct nex_cq {
+	struct verbs_cq vcq;
+	struct ibv_wc *entries;
+	uint32_t capacity;
+	uint32_t head;
+	uint32_t tail;
+	pthread_spinlock_t lock;
+	pthread_cond_t cond;
+};
+
+struct nex_recv_entry {
+	uint64_t wr_id;
+	struct ibv_sge sge;
+};
+
+/*
+ * Shared receive queue: a recv ring identical to the per-QP one, shared by
+ * every QP created with ibv_qp_init_attr.srq set. Consumers (rx fibers of
+ * the attached QPs) pop entries under the SRQ lock instead of the QP lock.
+ * Needed by consumers like UCCL whose data path posts all recv WRs to one
+ * SRQ (rdma_io.h SharedIOContext).
+ */
+struct nex_srq {
+	struct ibv_srq ibv_srq;
+	struct nex_recv_entry *recv_queue;
+	uint32_t recv_size;
+	uint32_t recv_head;
+	uint32_t recv_tail;
+	pthread_spinlock_t lock;
+};
+
+struct nex_pending_msg;
+
+struct nex_pending_read {
+	uint64_t wr_id;
+	int num_sge;
+	size_t total_len;
+	bool completion_requested;
+	struct ibv_sge sge[NEX_MAX_SGE];
+	struct nex_pending_read *next;
+};
+
+struct nex_send_task;
+struct nex_tx_wait_entry;
+
+struct nex_qp {
+	struct verbs_qp vqp;
+	struct nex_context *ctx;
+	struct nex_cq *send_cq;
+	struct nex_cq *recv_cq;
+	pthread_spinlock_t lock;
+	pthread_cond_t recv_cond;
+	struct nex_recv_entry *recv_queue;
+	uint32_t recv_size;
+	uint32_t recv_head;
+	uint32_t recv_tail;
+	struct nex_srq *srq;	/* non-NULL: recvs come from the SRQ */
+	int tx_fd;
+	int rx_fd;
+	bool rx_running;
+	uint32_t remote_qp_num;
+	uint32_t remote_lid;
+	bool sq_sig_all;
+	uint8_t *send_buf;
+	size_t send_buf_capacity;
+	/* Shared with application pthreads; RX fibers acquire cooperatively. */
+	pthread_spinlock_t rdma_lock;
+	struct nex_pending_read *pending_reads;
+	pthread_mutex_t state_lock;
+	pthread_cond_t state_cond;
+	bool destroying;
+	bool connect_in_progress;
+	int connect_status;
+	bool rx_worker_done;
+	bool tx_sender_done;
+	bool tx_worker_done;
+	
+	struct nex_pending_msg *pending_head;
+	struct nex_pending_msg *pending_tail;
+
+	// Cross-thread send task handoff (post_send -> tx fiber)
+	struct nex_send_task **send_task_queue;
+	uint32_t send_task_qsize;
+	uint32_t send_task_head;
+	uint32_t send_task_tail;
+	pthread_spinlock_t send_task_lock;
+
+	// TX completion handoff (tx send fiber -> tx wait fiber)
+	struct nex_tx_wait_entry *tx_wait_queue;
+	uint32_t tx_wait_qsize;
+	uint32_t tx_wait_head;
+	uint32_t tx_wait_tail;
+
+	atomic_bool tx_running;
+	uint32_t next_tag;
+};
+
+struct nex_mr {
+	struct verbs_mr vmr;
+	struct nex_mr *next;
+};
+
+/*
+ * Convert libibverbs public objects back to our provider-private containers.
+ * These must walk through the verbs_* wrappers, not jump directly.
+ */
+static inline struct nex_context *to_nctx(struct ibv_context *ibctx)
+{
+    struct verbs_context *vctx = container_of(ibctx, struct verbs_context, context);
+    return container_of(vctx, struct nex_context, ibv_ctx);
+}
+
+static inline struct nex_device *to_ndev(struct ibv_device *ibdev)
+{
+    struct verbs_device *vdev = container_of(ibdev, struct verbs_device, device);
+    return container_of(vdev, struct nex_device, ibv_dev);
+}
+
+static inline struct nex_pd *to_npd(struct ibv_pd *pd)
+{
+	return container_of(pd, struct nex_pd, ibv_pd);
+}
+
+static inline struct nex_cq *to_ncq(struct ibv_cq *ibcq)
+{
+	return container_of(ibcq, struct nex_cq, vcq.cq);
+}
+
+static inline struct nex_qp *to_nqp(struct ibv_qp *ibqp)
+{
+	return container_of(ibqp, struct nex_qp, vqp.qp);
+}
+
+static inline struct nex_mr *to_nmr(struct ibv_mr *ibmr)
+{
+	return container_of(ibmr, struct nex_mr, vmr.ibv_mr);
+}
+
+static inline struct nex_srq *to_nsrq(struct ibv_srq *ibsrq)
+{
+	return container_of(ibsrq, struct nex_srq, ibv_srq);
+}
+
+#endif /* NEX_H */

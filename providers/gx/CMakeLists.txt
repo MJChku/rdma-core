@@ -1,12 +1,11 @@
 add_compile_options(-O2)
 get_filename_component(GX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../.." ABSOLUTE)
-include_directories("${GX_ROOT}" "${GX_ROOT}/third_party/simbricks/lib")
+include_directories("${GX_ROOT}")
 rdma_provider(gx
   nex.c
   nex_shm.c
   nex_tcp.c
-  nex_simbricks.c
-  "${GX_ROOT}/third_party/simbricks/lib/simbricks/base/if.c"
+  nex_timing.c
   cm/nex_cm.c
 )
 
